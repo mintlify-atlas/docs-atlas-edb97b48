@@ -1,80 +1,138 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Get started with room: add a waiting room to Gin apps"
+description: "Install room, initialize a WaitingRoom, register routes on your Gin engine, and verify that excess traffic is queued — all in a single Go file."
 ---
 
-## Get started in three steps
+This guide walks through adding a FIFO waiting room to an existing Gin application from scratch. By the end you will have a running server where the 501st concurrent request sees a live queue page instead of an error, and is admitted automatically when a slot opens.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install the package">
+    Add `room` to your Go module. It has one transitive dependency — [sema](https://github.com/andreimerlescu/sema) — and requires Go 1.22 or later.
 
-### Step 1: Set up your local environment
+    ```bash
+    go get github.com/andreimerlescu/room
+    ```
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    Verify the import path resolves:
 
-### Step 2: Deploy your changes
+    ```bash
+    go list -m github.com/andreimerlescu/room
+    ```
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Initialize and register routes">
+    The minimal setup is three method calls. Create a `WaitingRoom`, call `Init` with your capacity, and pass your `*gin.Engine` to `RegisterRoutes`. Every route registered **after** `RegisterRoutes` is gated by the waiting room.
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```go main.go
+    package main
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    import (
+        "log"
 
-### Step 3: Go live
+        "github.com/andreimerlescu/room"
+        "github.com/gin-gonic/gin"
+    )
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    func main() {
+        r := gin.Default()
 
-## Next steps
+        wr := &room.WaitingRoom{}
+        if err := wr.Init(500); err != nil {
+            log.Fatal(err)
+        }
+        defer wr.Stop()
 
-Now that you have your docs running, explore these key features:
+        // Registers GET /queue/status and attaches the middleware.
+        // Routes added after this call are gated.
+        wr.RegisterRoutes(r)
 
-<CardGroup cols={2}>
+        r.GET("/", func(c *gin.Context) {
+            c.String(200, "You're in!")
+        })
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+        r.Run(":8080")
+    }
+    ```
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+    `RegisterRoutes` does three things in the correct order:
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+    1. Registers `OPTIONS /queue/status` for CORS preflight support.
+    2. Registers `GET /queue/status` — the polling endpoint used by the waiting room page.
+    3. Attaches `wr.Middleware()` via `r.Use(...)` so all subsequent routes are gated.
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+    <Note>`defer wr.Stop()` cancels the background reaper goroutine on shutdown. Always include it to avoid leaked goroutines, especially in tests or embedded servers.</Note>
+  </Step>
 
-</CardGroup>
+  <Step title="Verify the waiting room activates">
+    Start the server, then open `http://localhost:8080/` in a browser or send a request with `curl`:
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+    ```bash
+    go run main.go
+    ```
+
+    ```bash
+    curl -i http://localhost:8080/
+    ```
+
+    When capacity is exhausted the server responds with `200 OK` and an HTML page showing the client's queue position. The page polls `GET /queue/status` every 3 seconds and reloads automatically when `ready=true` is returned.
+
+    The `/queue/status` JSON payload looks like this while a client is waiting:
+
+    ```json
+    {
+      "ready": false,
+      "position": 4,
+      "utilization": 1.0
+    }
+    ```
+
+    And like this when the client is ready to be admitted:
+
+    ```json
+    {
+      "ready": true
+    }
+    ```
+
+    <Tip>Open `http://localhost:8080/` in a browser while running the [sample load test](https://github.com/andreimerlescu/room/tree/main/sample/basic-web-app) (`bash test.sh`) to see the position counter tick down in real time.</Tip>
+  </Step>
+
+  <Step title="Production hardening and next steps">
+    The default configuration is designed for local development. Before deploying to production, apply these two settings:
+
+    ```go
+    // Set the Secure flag on session cookies. Required for HTTPS deployments,
+    // including those behind a TLS-terminating proxy (nginx, Cloudflare, ALB).
+    wr.SetSecureCookie(true)
+
+    // Prevent unbounded memory growth — reject arrivals beyond this queue depth.
+    // New arrivals receive 503 Service Unavailable when the limit is reached.
+    if err := wr.SetMaxQueueDepth(10000); err != nil {
+        log.Fatal(err)
+    }
+    ```
+
+    For simple cases where you do not need to retain a reference to `WaitingRoom`, use `NewWaitingRoom`. It registers `/queue/status` and returns the middleware handler in a single call. Note that `NewWaitingRoom` starts a background goroutine tied to the process lifetime — there is no way to call `Stop()`:
+
+    ```go
+    r.Use(room.NewWaitingRoom(r, 500))
+    ```
+
+    When you are ready to go further:
+
+    <CardGroup cols={2}>
+      <Card title="How it works" icon="diagram-project" href="/how-it-works">
+        Understand the ticket counter, serving window, semaphore, and reaper internals in depth.
+      </Card>
+      <Card title="Skip the line" icon="credit-card" href="/guides/skip-the-line">
+        Add paid queue jumping with flat or surge pricing and Stripe integration.
+      </Card>
+      <Card title="Lifecycle callbacks" icon="bell" href="/guides/lifecycle-callbacks">
+        React to EventFull and EventDrain for autoscaling without polling.
+      </Card>
+      <Card title="Configuration" icon="sliders" href="/guides/configuration">
+        Tune capacity, reaper interval, cookie scope, and max queue depth at runtime.
+      </Card>
+    </CardGroup>
+  </Step>
+</Steps>

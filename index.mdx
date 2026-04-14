@@ -1,97 +1,92 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "room: FIFO waiting room library for Go and Gin apps"
+description: "room is a drop-in Gin middleware that queues excess requests in FIFO order, shows clients their live position, and admits them automatically as slots open."
 ---
 
-## Setting up
+`room` is a single-import Go middleware for [Gin](https://github.com/gin-gonic/gin) that turns traffic spikes into an orderly waiting room. When your application hits capacity, every excess request gets a ticket, sees their queue position update in real time, and is admitted automatically the moment a slot opens — no dropped requests, no blind retries.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Add a waiting room to your Gin app in under 5 minutes with three lines of code.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="How it works" icon="diagram-project" href="/how-it-works">
+    Understand the ticket counter, serving window, semaphore, and reaper design.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Skip the line" icon="credit-card" href="/guides/skip-the-line">
+    Let clients pay to jump the queue with configurable flat or surge pricing.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/waiting-room">
+    Complete reference for every method, type, and event in the public API.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Get up and running
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Install">
+    ```bash
+    go get github.com/andreimerlescu/room
+    ```
+    Requires Go 1.22+ and Gin.
+  </Step>
+  <Step title="Initialize and register">
+    ```go main.go
+    package main
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+    import (
+        "log"
+        "github.com/andreimerlescu/room"
+        "github.com/gin-gonic/gin"
+    )
 
-## Need inspiration?
+    func main() {
+        r := gin.Default()
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+        wr := &room.WaitingRoom{}
+        if err := wr.Init(500); err != nil {
+            log.Fatal(err)
+        }
+        defer wr.Stop()
+
+        wr.RegisterRoutes(r)
+
+        r.GET("/", func(c *gin.Context) {
+            c.String(200, "You're in!")
+        })
+
+        r.Run(":8080")
+    }
+    ```
+    The 501st concurrent request sees the waiting room. Every earlier request passes through unmodified.
+  </Step>
+  <Step title="Add optional features">
+    Configure skip-the-line pricing, VIP passes, lifecycle callbacks, and runtime capacity adjustments as your needs grow.
+  </Step>
+</Steps>
+
+## Why room?
+
+When your application hits capacity, you have three choices:
+
+| Strategy | What happens | User experience |
+|---|---|---|
+| **Drop (429)** | Reject the request | User sees an error, retries blindly, amplifies the spike |
+| **Blind queue** | Buffer with no ordering | No position awareness, no ETA, users refresh and make it worse |
+| **Waiting room** | Issue a ticket, show position, admit in order | User waits calmly, knows their place, gets in automatically |
+
+`room` implements the third strategy with FIFO ordering, live position tracking, a polished waiting-room page, and a full suite of production features.
+
+<CardGroup cols={2}>
+  <Card title="Lifecycle callbacks" icon="bell" href="/guides/lifecycle-callbacks">
+    React to EventFull, EventDrain, EventEnter, and more for autoscaling and metrics.
+  </Card>
+  <Card title="VIP passes" icon="star" href="/guides/vip-passes">
+    Issue time-limited passes after payment so clients skip automatically on re-entry.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/guides/configuration">
+    Adjust capacity, reaper interval, cookie security, and queue depth at runtime.
+  </Card>
+  <Card title="Security" icon="shield" href="/guides/security">
+    Learn about cookie hardening, queue flooding protection, and poll rate limits.
+  </Card>
+</CardGroup>

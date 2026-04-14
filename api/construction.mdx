@@ -1,0 +1,317 @@
+---
+title: "Constructing a WaitingRoom: Init, Stop, and routes"
+description: "Create a WaitingRoom via NewWaitingRoom for simple servers, or use Init and Stop for lifecycle control, clean goroutine shutdown, and test-safe setups."
+---
+
+The `room` package provides two construction functions and a manual initialization path. Which one you choose depends on whether you need an explicit handle to the `WaitingRoom` after startup — for example, to call `Stop` on shutdown, adjust configuration at runtime, or inspect queue depth in tests.
+
+## `NewWaitingRoom`
+
+```go
+func NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc
+```
+
+`NewWaitingRoom` is the simplest entry point. It creates and initializes a `WaitingRoom` with the given capacity, registers `GET /queue/status` on the engine, and returns the middleware `gin.HandlerFunc`.
+
+<ParamField path="r" type="*gin.Engine" required>
+  The Gin engine to register the status route on. Must be non-nil.
+</ParamField>
+
+<ParamField path="cap" type="int32" required>
+  Maximum number of requests actively served at any moment. Valid range: `1` to `math.MaxInt32`. Panics with a descriptive message if `cap < 1`.
+</ParamField>
+
+**Returns:** `gin.HandlerFunc` — apply it with `r.Use(...)`.
+
+```go
+r := gin.Default()
+r.Use(room.NewWaitingRoom(r, 500))
+
+r.GET("/", func(c *gin.Context) {
+    c.String(http.StatusOK, "hello")
+})
+r.Run(":8080")
+```
+
+<Warning>
+`NewWaitingRoom` starts a background reaper goroutine whose lifetime is tied to the process. There is no way to stop it later because the underlying `WaitingRoom` is not returned. Do not use `NewWaitingRoom` in tests or embedded servers where goroutine leaks are observable.
+</Warning>
+
+<Tip>
+`NewWaitingRoom` only registers `GET /queue/status`. It does not register the `OPTIONS /queue/status` handler needed for CORS preflight. If your deployment has CORS middleware, use `RegisterRoutes` instead — it adds the OPTIONS handler automatically.
+</Tip>
+
+**When to use:** long-lived server processes with no requirement for explicit shutdown.
+
+**When not to use:** tests, embedded servers, anything that calls `httptest.NewServer`, or any scenario where you need `Stop()`, runtime configuration changes, or queue introspection.
+
+---
+
+## `NewWaitingRoomFromStruct`
+
+```go
+func NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc
+```
+
+`NewWaitingRoomFromStruct` returns a `gin.HandlerFunc` from an already-initialized `WaitingRoom`. Use this when you have constructed and configured the `WaitingRoom` yourself and want to apply the middleware without re-initializing.
+
+<ParamField path="wr" type="*WaitingRoom" required>
+  A non-nil, already-initialized `WaitingRoom`. Panics if nil.
+</ParamField>
+
+**Returns:** `gin.HandlerFunc`.
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(200); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+wr.SetSecureCookie(true)
+wr.SetMaxQueueDepth(5000)
+
+r := gin.Default()
+r.GET("/queue/status", wr.StatusHandler())
+r.Use(room.NewWaitingRoomFromStruct(wr))
+
+r.GET("/", myHandler)
+r.Run(":8080")
+```
+
+<Note>
+`NewWaitingRoomFromStruct` is equivalent to calling `wr.Middleware()` directly. Prefer `wr.RegisterRoutes(r)` unless you need to register the status handler on a different sub-router.
+</Note>
+
+---
+
+## `WaitingRoom.Init`
+
+```go
+func (wr *WaitingRoom) Init(cap int32) error
+```
+
+`Init` initializes the `WaitingRoom` fields and starts the background reaper goroutine. It must be called before `Middleware`, `StatusHandler`, or `RegisterRoutes` when constructing a `WaitingRoom` manually.
+
+<ParamField path="cap" type="int32" required>
+  Maximum concurrently active requests. Must be `≥ 1`.
+</ParamField>
+
+**Returns:** `error` — returns `ErrInvalidCap` if `cap < 1`, `nil` on success.
+
+<Warning>
+`Init` is not safe for concurrent use. Call it exactly once during setup, before any goroutines begin serving traffic. To change capacity at runtime, use `SetCap`. To change the reaper interval at runtime, use `SetReaperInterval`.
+</Warning>
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    // err is room.ErrInvalidCap if cap < 1
+    log.Fatal(err)
+}
+```
+
+**What `Init` sets up:**
+
+- Semaphore with the given capacity
+- Token store and pass store (empty)
+- Atomic counters (`nowServing`, `nextTicket`) reset to zero
+- Default reaper interval (`5m`)
+- Default cookie settings (`Path: "/"`, `Domain: ""`, `Secure: false`)
+- Passes disabled by default (`passDuration: 0`)
+- Background reaper goroutine via an internal context
+
+---
+
+## `WaitingRoom.Stop`
+
+```go
+func (wr *WaitingRoom) Stop()
+```
+
+`Stop` cancels the context driving the background reaper goroutine. The reaper exits cleanly on the next iteration; in-flight requests are not affected.
+
+`Stop` is idempotent: calling it multiple times, or calling it before `Init`, is safe. It does nothing if the reaper was never started.
+
+```go
+wr := &room.WaitingRoom{}
+wr.Init(500)
+defer wr.Stop() // always safe to defer
+```
+
+<Tip>
+Use `defer wr.Stop()` immediately after a successful `Init` call. This ensures cleanup even if a subsequent configuration step returns an error and your `main` function returns early.
+</Tip>
+
+---
+
+## `WaitingRoom.RegisterRoutes`
+
+```go
+func (wr *WaitingRoom) RegisterRoutes(r *gin.Engine)
+```
+
+`RegisterRoutes` registers the following three entries on the engine in order:
+
+1. `OPTIONS /queue/status` → responds `204 No Content` (CORS preflight)
+2. `GET /queue/status` → `wr.StatusHandler()`
+3. `r.Use(wr.Middleware())` → waiting room gate for all subsequent routes
+
+<ParamField path="r" type="*gin.Engine" required>
+  The Gin engine to register routes on. Must be non-nil.
+</ParamField>
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+// Register payment or bypass routes BEFORE RegisterRoutes.
+r.POST("/payment/confirm", paymentHandler)
+
+// Wire up the waiting room.
+wr.RegisterRoutes(r)
+
+// Application routes registered AFTER are gated by the middleware.
+r.GET("/products", listProducts)
+r.GET("/checkout", checkoutHandler)
+```
+
+<Warning>
+Any route registered on the engine **after** `RegisterRoutes` is called will be subject to the waiting room middleware. Register payment confirmation endpoints, webhook receivers, and other bypass routes before calling `RegisterRoutes`.
+</Warning>
+
+<Note>
+`RegisterRoutes` automatically registers the `OPTIONS /queue/status` handler for CORS preflight. If your polling JavaScript uses `fetch()` from a different origin, this handler ensures browser preflight checks succeed without additional configuration.
+</Note>
+
+---
+
+## `WaitingRoom.Middleware`
+
+```go
+func (wr *WaitingRoom) Middleware() gin.HandlerFunc
+```
+
+`Middleware` returns the core gate handler. On each request it issues or resumes a ticket, checks whether the ticket falls within the serving window, and either admits the request (`c.Next()`) or serves the waiting room HTML page and aborts.
+
+Use this directly only when you need to mount the middleware separately from `StatusHandler` — for example, on a sub-group rather than the root engine.
+
+```go
+api := r.Group("/api")
+api.Use(wr.Middleware())
+api.GET("/data", dataHandler)
+```
+
+---
+
+## `WaitingRoom.StatusHandler`
+
+```go
+func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc
+```
+
+`StatusHandler` returns the handler for `/queue/status`. Queued clients poll this endpoint at a configurable interval. The response is a JSON object:
+
+| Field | Type | Description |
+|---|---|---|
+| `ready` | `bool` | `true` if the client's ticket is within the serving window. |
+| `position` | `int64` | Queue position; omitted when `ready` is `true`. |
+| `utilization` | `float64` | EWMA-smoothed utilization at poll time. |
+| `skip_cost` | `float64` | Total cost to jump to position 1. Omitted if no `RateFunc`. |
+| `rate_per_pos` | `float64` | Per-position rate. Omitted if no `RateFunc`. |
+| `has_pass` | `bool` | `true` if the client holds a valid VIP pass. |
+
+The handler enforces a per-token rate limit of one poll per second. Requests arriving faster receive `429 Too Many Requests` with a `Retry-After: 1` header.
+
+<Note>
+Register `StatusHandler` **before** `r.Use(Middleware())`. If you use `RegisterRoutes`, this ordering is handled automatically.
+</Note>
+
+---
+
+## Pattern comparison
+
+<Tabs>
+  <Tab title="Simple server">
+    Use `NewWaitingRoom` when you have a long-lived process and do not need to stop the room or inspect it after startup.
+
+    ```go
+    package main
+
+    import (
+        "github.com/andreimerlescu/room"
+        "github.com/gin-gonic/gin"
+    )
+
+    func main() {
+        r := gin.Default()
+        r.Use(room.NewWaitingRoom(r, 500))
+        r.GET("/", func(c *gin.Context) {
+            c.String(200, "ok")
+        })
+        r.Run(":8080")
+    }
+    ```
+  </Tab>
+  <Tab title="Full control">
+    Use `Init` + `Stop` when you need configuration, graceful shutdown, or test isolation.
+
+    ```go
+    package main
+
+    import (
+        "time"
+        "log"
+
+        "github.com/andreimerlescu/room"
+        "github.com/gin-gonic/gin"
+    )
+
+    func main() {
+        wr := &room.WaitingRoom{}
+        if err := wr.Init(500); err != nil {
+            log.Fatal(err)
+        }
+        defer wr.Stop()
+
+        wr.SetSecureCookie(true)
+        wr.SetReaperInterval(30 * time.Second)
+        wr.SetMaxQueueDepth(10000)
+
+        r := gin.Default()
+        wr.RegisterRoutes(r)
+        r.GET("/", func(c *gin.Context) {
+            c.String(200, "ok")
+        })
+        r.Run(":8080")
+    }
+    ```
+  </Tab>
+  <Tab title="Test setup">
+    Use `Init` + `Stop` in tests to prevent goroutine leaks between test cases.
+
+    ```go
+    func TestWaitingRoom(t *testing.T) {
+        wr := &room.WaitingRoom{}
+        if err := wr.Init(2); err != nil {
+            t.Fatal(err)
+        }
+        t.Cleanup(wr.Stop)
+
+        r := gin.New()
+        wr.RegisterRoutes(r)
+        r.GET("/", func(c *gin.Context) {
+            c.String(200, "ok")
+        })
+
+        srv := httptest.NewServer(r)
+        defer srv.Close()
+
+        // ... test assertions
+    }
+    ```
+  </Tab>
+</Tabs>

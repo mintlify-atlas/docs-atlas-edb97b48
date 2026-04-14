@@ -1,0 +1,127 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "room",
+  "projectDescription": "A FIFO waiting room middleware for Go and Gin that queues excess requests, shows clients their position in real time, and admits them in order as capacity opens.",
+  "theme": "luma",
+  "primaryColor": "#ffffff",
+  "lightColor": "#74d7ed",
+  "darkColor": "#38484e",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/skip-the-line",
+              "guides/vip-passes",
+              "guides/lifecycle-callbacks",
+              "guides/configuration",
+              "guides/security"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/stripe-integration",
+              "examples/autoscaling",
+              "examples/sample-app"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core",
+            "pages": [
+              "api/waiting-room",
+              "api/construction",
+              "api/configuration"
+            ]
+          },
+          {
+            "group": "Queue & Promotion",
+            "pages": [
+              "api/queue-status",
+              "api/promote",
+              "api/vip-passes"
+            ]
+          },
+          {
+            "group": "Events & Types",
+            "pages": [
+              "api/events",
+              "api/types",
+              "api/errors"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "FIFO ticket-ordered queue with live position tracking",
+    "Auto-admission via browser polling — no refresh required",
+    "Skip-the-line paid queue jumping with configurable per-position pricing",
+    "Surge pricing via RateFunc — price scales with queue depth",
+    "Time-limited VIP passes that auto-promote clients across queue re-entries",
+    "Edge-triggered lifecycle callbacks (EventFull, EventDrain, EventEnter, EventExit, etc.) for autoscaling and observability",
+    "Background reaper that evicts abandoned tokens and prevents ghost-ticket queue stalls",
+    "Max queue depth circuit breaker to protect memory under extreme load",
+    "Runtime capacity adjustment via SetCap — no restart required",
+    "Configurable cookie security (HttpOnly, Secure, SameSite, Path, Domain)",
+    "Sub-3μs fast path; sub-nanosecond QueueDepth and UtilizationSmoothed reads",
+    "Drop-in single-import integration — one Init, one RegisterRoutes"
+  ],
+  "publicApiSurface": [
+    "NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc",
+    "NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc",
+    "WaitingRoom.Init(cap int32) error",
+    "WaitingRoom.Stop()",
+    "WaitingRoom.RegisterRoutes(r *gin.Engine)",
+    "WaitingRoom.Middleware() gin.HandlerFunc",
+    "WaitingRoom.StatusHandler() gin.HandlerFunc",
+    "WaitingRoom.SetCap(cap int32) error",
+    "WaitingRoom.Cap() int32",
+    "WaitingRoom.Len() int",
+    "WaitingRoom.QueueDepth() int64",
+    "WaitingRoom.Utilization() float64",
+    "WaitingRoom.UtilizationSmoothed() float64",
+    "WaitingRoom.SetHTML(html []byte)",
+    "WaitingRoom.SetSecureCookie(secure bool)",
+    "WaitingRoom.SetCookiePath(path string)",
+    "WaitingRoom.SetCookieDomain(domain string)",
+    "WaitingRoom.SetMaxQueueDepth(max int64) error",
+    "WaitingRoom.MaxQueueDepth() int64",
+    "WaitingRoom.SetReaperInterval(d time.Duration) error",
+    "WaitingRoom.ReaperInterval() time.Duration",
+    "WaitingRoom.SetRateFunc(fn RateFunc)",
+    "WaitingRoom.SetSkipURL(url string)",
+    "WaitingRoom.SkipURL() string",
+    "WaitingRoom.SetPassDuration(d time.Duration) error",
+    "WaitingRoom.PassDuration() time.Duration",
+    "WaitingRoom.QuoteCost(token string, targetPosition int64) (float64, error)",
+    "WaitingRoom.PromoteToken(token string, targetPosition int64) (PromoteResult, error)",
+    "WaitingRoom.PromoteTokenToFront(token string) (PromoteResult, error)",
+    "WaitingRoom.GrantPass() string",
+    "WaitingRoom.HasValidPass(passToken string) bool",
+    "WaitingRoom.On(event Event, fn CallbackFunc)",
+    "WaitingRoom.Off(event Event)",
+    "type RateFunc func(queueDepth int64) float64",
+    "type CallbackFunc func(snap Snapshot)",
+    "type Snapshot struct { Event; Occupancy; Capacity; QueueDepth }",
+    "type PromoteResult struct { Cost float64; PassToken string }",
+    "type Event uint8 (EventEnter, EventExit, EventFull, EventDrain, EventQueue, EventEvict, EventTimeout, EventPromote)"
+  ]
+}

@@ -1,0 +1,177 @@
+---
+title: "GET /queue/status — waiting-room queue status endpoint"
+description: "Polling endpoint for waiting-room clients. Returns position, EWMA utilization, and optional skip pricing. Rate-limited to one poll per second per token."
+---
+
+The `/queue/status` endpoint is the heartbeat of the waiting room. The waiting-room HTML page calls it repeatedly until `ready` is `true`, at which point the page redirects the client to retry their original request. Each successful poll refreshes the token's sliding TTL so that actively waiting clients are never evicted by the background reaper.
+
+## Registration
+
+`RegisterRoutes` registers this endpoint automatically and attaches `Middleware` **after** it, so status polls always bypass the queue. If you register routes manually, you must add `StatusHandler` before `Use(Middleware())`:
+
+```go main.go
+wr := &room.WaitingRoom{}
+wr.Init(500)
+wr.RegisterRoutes(r) // registers GET /queue/status, then Use(Middleware())
+```
+
+<Warning>
+Always register `StatusHandler` before `Middleware`. If the middleware runs first, the polling request itself enters the queue and the waiting room page can never make progress.
+</Warning>
+
+## Endpoint
+
+```http
+GET /queue/status
+```
+
+### Cookie requirement
+
+The handler reads the `room_ticket` cookie set when the client was first placed in the queue. If the cookie is absent or the token has expired, the handler returns `ready: true` immediately so the client retries the original request and either enters capacity or re-queues cleanly.
+
+### Rate limiting
+
+Each token is allowed one poll per `1 second` (`statusPollMinInterval`). A request that arrives before the interval has elapsed receives a `429 Too Many Requests` response with a `Retry-After: 1` header. The handler does **not** update the sliding TTL on rate-limited polls.
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+```
+
+## Response schema
+
+<ResponseField name="ready" type="bool" required>
+  `true` when the client can be admitted — either because they have reached the front of the queue or because their token was not found (expired or never issued). The waiting-room page redirects to the original URL when this is `true`.
+</ResponseField>
+
+<ResponseField name="position" type="int64">
+  Current queue position. Omitted when `ready` is `true`. Position `1` means next to be admitted once a slot opens.
+</ResponseField>
+
+<ResponseField name="utilization" type="float64">
+  EWMA-smoothed utilization of the serving window, in the range `[0.0, 1.0]`. Omitted when `ready` is `true`. Useful for displaying a load indicator on the waiting-room page.
+</ResponseField>
+
+<ResponseField name="skip_cost" type="float64">
+  Total cost to jump to position 1 at the current rate. Only present when a `RateFunc` is configured via `SetRateFunc` **and** the client does not hold a valid VIP pass (`has_pass` is `false`). Omitted when the client is already at position 1.
+</ResponseField>
+
+<ResponseField name="rate_per_pos" type="float64">
+  Per-position rate returned by `RateFunc` for the current queue depth. Only present under the same conditions as `skip_cost`. Use this to show a per-position price breakdown on the payment page.
+</ResponseField>
+
+<ResponseField name="has_pass" type="bool">
+  `true` when the client presents a valid `room_pass` cookie. When `true`, `skip_cost` and `rate_per_pos` are both omitted from the response because the client will be auto-promoted without payment.
+</ResponseField>
+
+### Example responses
+
+<CodeGroup>
+
+```json waiting (no pass)
+{
+  "ready": false,
+  "position": 42,
+  "utilization": 0.87,
+  "skip_cost": 20.50,
+  "rate_per_pos": 0.50
+}
+```
+
+```json waiting (VIP pass)
+{
+  "ready": false,
+  "position": 42,
+  "utilization": 0.87,
+  "has_pass": true
+}
+```
+
+```json ready
+{
+  "ready": true
+}
+```
+
+```json rate limited
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+
+{
+  "ready": false,
+  "position": 42
+}
+```
+
+</CodeGroup>
+
+## Sliding TTL
+
+Every successful poll (where the client is still waiting and the rate limit has not been exceeded) calls `touchIssuedAt`, which resets the token's `issuedAt` timestamp to `time.Now()`. This means the effective expiry window is `30 minutes` (`cookieTTL`) from the **last poll**, not from initial issuance. Clients that stop polling — tab closed, network lost — are naturally evicted after 30 minutes of inactivity.
+
+## Token expiry check
+
+Before reading the token entry, `StatusHandler` calls `deleteIfExpired`, which acquires a write lock and atomically checks and deletes the token in a single operation. This eliminates the TOCTOU window that a separate check-then-delete pattern would create. If the token is found to be expired, the handler returns `ready: true`.
+
+## Polling from JavaScript
+
+The waiting-room page should poll with a small random jitter to avoid thundering-herd behaviour when many clients are released simultaneously.
+
+```javascript waiting-room.js
+async function pollStatus() {
+  const jitter = Math.random() * 1000; // 0–1000 ms
+  await new Promise((r) => setTimeout(r, 3000 + jitter));
+
+  try {
+    const res = await fetch("/queue/status", { credentials: "same-origin" });
+
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
+      await new Promise((r) => setTimeout(r, retryAfter * 1000));
+      return pollStatus();
+    }
+
+    const data = await res.json();
+
+    if (data.ready) {
+      window.location.reload();
+      return;
+    }
+
+    document.getElementById("position").textContent = data.position;
+
+    if (data.skip_cost != null) {
+      document.getElementById("skip-cost").textContent =
+        `$${data.skip_cost.toFixed(2)}`;
+    }
+  } catch (_) {
+    // Network error — retry after back-off
+  }
+
+  pollStatus();
+}
+
+pollStatus();
+```
+
+<Tip>
+Add `credentials: "same-origin"` to every `fetch` call so the browser sends the `room_ticket` cookie automatically.
+</Tip>
+
+## CORS
+
+If you serve the waiting-room HTML page from a different origin than the API, register an `OPTIONS` handler so that preflight requests succeed. `RegisterRoutes` already does this for you. If you register routes manually:
+
+```go main.go
+r.OPTIONS("/queue/status", func(c *gin.Context) {
+    c.Status(http.StatusNoContent)
+})
+r.GET("/queue/status", wr.StatusHandler())
+r.Use(wr.Middleware())
+```
+
+## Related
+
+- [`RegisterRoutes`](/api/construction) — automatic route and middleware registration
+- [`PromoteToken`](/api/promote) — move a token to a target position
+- [`HasValidPass`](/api/vip-passes) — check whether a `room_pass` cookie is valid

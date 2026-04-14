@@ -1,0 +1,251 @@
+---
+title: "Lifecycle callbacks for autoscaling and observability"
+description: "Register On/Off handlers for all 8 room events to react to capacity transitions, queue growth, and promotions in real time without polling or sidecars."
+---
+
+`room` exposes a full event system that lets you react to every meaningful state change without polling, without a sidecar process, and without tangling business logic into the middleware hot path. Register handlers with `On` and remove them with `Off`. Each handler receives a `Snapshot` — a point-in-time copy of the room's state — and runs in its own goroutine, so a slow callback never stalls an incoming request.
+
+## Events at a glance
+
+| Event | Fires when | Primary use case |
+|---|---|---|
+| `EventEnter` | A request acquires a semaphore slot and is admitted | Throughput metrics, load balancer weight updates |
+| `EventExit` | A request completes and releases its slot | Latency tracking, slot lifetime histograms |
+| `EventFull` | Room transitions from below capacity to at capacity (edge-triggered) | Scale-out trigger — provision a new host |
+| `EventDrain` | Room transitions from full back to having at least one free slot (edge-triggered) | Scale-in signal — deregister a host |
+| `EventQueue` | An arriving request cannot be admitted and is issued a waiting room ticket | Queue depth alerting, demand forecasting |
+| `EventEvict` | Reaper removes an expired token from the token store | Ghost ticket monitoring, queue health checks |
+| `EventTimeout` | A queued request's context is cancelled before admission | Client timeout tracking, SLO alerting |
+| `EventPromote` | A client is promoted via payment or VIP pass auto-promotion | Revenue tracking, fairness monitoring |
+
+<Note>
+`EventFull` and `EventDrain` are **edge-triggered**, not level-triggered. `EventFull` fires once when the room transitions to full — not on every admission while the room is already full. `EventDrain` fires once when the room transitions from full back to available. This means your autoscaler callback fires exactly when it needs to, not thousands of times during a sustained traffic spike.
+</Note>
+
+## Snapshot
+
+Every callback receives a `Snapshot` — a copy of the room's state at the moment the event fired. All fields are safe to read after the room's state has changed.
+
+```go
+type Snapshot struct {
+    // Event is the lifecycle event that produced this snapshot.
+    Event Event
+
+    // Occupancy is the number of semaphore slots in use at the moment of the event.
+    Occupancy int
+
+    // Capacity is the maximum number of concurrent occupants allowed.
+    Capacity int
+
+    // QueueDepth is the number of requests currently waiting for a slot.
+    QueueDepth int64
+}
+
+func (s Snapshot) Full()  bool // Occupancy >= Capacity
+func (s Snapshot) Empty() bool // Occupancy == 0
+```
+
+## Registering and removing handlers
+
+```go
+// Register a handler. Multiple handlers per event are supported.
+// fn receives a Snapshot — a point-in-time copy of room state.
+wr.On(room.EventFull, func(s room.Snapshot) {
+    // your handler here
+})
+
+// Remove ALL handlers for an event at once.
+wr.Off(room.EventFull)
+```
+
+`On` is safe to call after the waiting room is already running — handlers take effect immediately. `Off` is also safe for concurrent use; handlers already executing are not interrupted.
+
+`CallbackFunc` signature:
+
+```go
+type CallbackFunc func(snap Snapshot)
+```
+
+## Callback examples
+
+<Tabs>
+  <Tab title="EventEnter / EventExit">
+    Track admission and completion for throughput and latency metrics:
+
+    ```go
+    wr.On(room.EventEnter, func(s room.Snapshot) {
+        metrics.Inc("room.enter")
+        metrics.Gauge("room.occupancy", float64(s.Occupancy))
+    })
+
+    wr.On(room.EventExit, func(s room.Snapshot) {
+        metrics.Inc("room.exit")
+        metrics.Gauge("room.occupancy", float64(s.Occupancy))
+    })
+    ```
+  </Tab>
+  <Tab title="EventFull / EventDrain">
+    Trigger autoscaling decisions on capacity transitions:
+
+    ```go
+    // Scale out when the room fills up.
+    wr.On(room.EventFull, func(s room.Snapshot) {
+        log.Printf("room full (%d/%d) — provisioning new host", s.Occupancy, s.Capacity)
+        go provisionHost()
+    })
+
+    // Scale back in when pressure drops.
+    wr.On(room.EventDrain, func(s room.Snapshot) {
+        log.Printf("room draining (%d/%d) — deregistering host", s.Occupancy, s.Capacity)
+        go deregisterHost()
+    })
+    ```
+
+    Because `EventFull` fires only on the transition edge, `provisionHost` is called once per saturation event — not once per admission during sustained load.
+  </Tab>
+  <Tab title="EventQueue">
+    React to queue growth for alerting and demand forecasting:
+
+    ```go
+    wr.On(room.EventQueue, func(s room.Snapshot) {
+        metrics.Inc("room.queue")
+        metrics.Gauge("room.queue_depth", float64(s.QueueDepth))
+
+        // Alert when the queue is deep.
+        if s.QueueDepth > 5000 {
+            pagerduty.Trigger("queue depth exceeded 5000")
+        }
+    })
+    ```
+  </Tab>
+  <Tab title="EventEvict">
+    Monitor ghost tickets and queue health:
+
+    ```go
+    wr.On(room.EventEvict, func(s room.Snapshot) {
+        metrics.Inc("room.evict")
+        log.Printf("reaper evicted expired token — queue depth now %d", s.QueueDepth)
+    })
+    ```
+  </Tab>
+  <Tab title="EventTimeout">
+    Track clients that disconnect before being admitted:
+
+    ```go
+    wr.On(room.EventTimeout, func(s room.Snapshot) {
+        metrics.Inc("room.timeout")
+        // Correlate with your SLO: if timeouts exceed a threshold,
+        // queue depth is too high for the configured capacity.
+        if metrics.Rate("room.timeout") > 0.05 {
+            alert.Send("timeout rate exceeds 5%")
+        }
+    })
+    ```
+  </Tab>
+  <Tab title="EventPromote">
+    Log revenue events and fairness monitoring:
+
+    ```go
+    wr.On(room.EventPromote, func(s room.Snapshot) {
+        metrics.Inc("room.promote")
+        log.Printf("queue jump — occupancy %d/%d, depth %d",
+            s.Occupancy, s.Capacity, s.QueueDepth)
+
+        // Track revenue attribution.
+        revenue.Record("skip_the_line", s.QueueDepth)
+    })
+    ```
+  </Tab>
+</Tabs>
+
+## Multiple handlers per event
+
+You can register multiple handlers for the same event. All are invoked in registration order, each in its own goroutine:
+
+```go
+// Both handlers run when the room fills.
+wr.On(room.EventFull, func(s room.Snapshot) {
+    go provisionHost()
+})
+wr.On(room.EventFull, func(s room.Snapshot) {
+    slack.Post("#ops", fmt.Sprintf("room full: %d/%d", s.Occupancy, s.Capacity))
+})
+```
+
+## Removing handlers
+
+`Off` removes all handlers registered for a given event. There is no per-handler removal — if you need selective removal, wrap your handlers in a flag or use a dispatcher struct.
+
+```go
+// Remove all EventFull handlers — e.g., after scaling infrastructure is torn down.
+wr.Off(room.EventFull)
+wr.Off(room.EventDrain)
+```
+
+## Autoscaling pattern
+
+Combine `EventFull`, `EventDrain`, and `EventQueue` for a complete autoscaling integration:
+
+```go
+wr.On(room.EventFull, func(s room.Snapshot) {
+    // Room hit capacity — provision additional serving capacity.
+    go infra.ScaleOut()
+})
+
+wr.On(room.EventDrain, func(s room.Snapshot) {
+    // Pressure has dropped — signal that scale-in is safe.
+    go infra.ScaleIn()
+})
+
+wr.On(room.EventQueue, func(s room.Snapshot) {
+    // Track queue buildup for predictive scaling.
+    autoscaler.ObserveQueueDepth(s.QueueDepth)
+})
+```
+
+## Asynchronous execution
+
+<Warning>
+Callbacks run asynchronously in goroutines. A slow or blocking callback — for example, one that makes a synchronous HTTP call to a provisioning API — never stalls the request path. However, if your callback panics, that goroutine will crash. Wrap callbacks that call external services with a recover or use a non-blocking send to a channel:
+
+```go
+wr.On(room.EventFull, func(s room.Snapshot) {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("callback panic: %v", r)
+        }
+    }()
+    go provisionHost()
+})
+```
+</Warning>
+
+## Complete observability setup
+
+Register all event handlers before calling `RegisterRoutes` to ensure no events are missed during startup:
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+// Throughput.
+wr.On(room.EventEnter,   func(s room.Snapshot) { metrics.Inc("room.enter") })
+wr.On(room.EventExit,    func(s room.Snapshot) { metrics.Inc("room.exit") })
+
+// Autoscaling.
+wr.On(room.EventFull,    func(s room.Snapshot) { go provisionHost() })
+wr.On(room.EventDrain,   func(s room.Snapshot) { go deregisterHost() })
+
+// Queue health.
+wr.On(room.EventQueue,   func(s room.Snapshot) { metrics.Inc("room.queue") })
+wr.On(room.EventEvict,   func(s room.Snapshot) { metrics.Inc("room.evict") })
+wr.On(room.EventTimeout, func(s room.Snapshot) { metrics.Inc("room.timeout") })
+
+// Revenue.
+wr.On(room.EventPromote, func(s room.Snapshot) { metrics.Inc("room.promote") })
+
+wr.RegisterRoutes(r)
+```

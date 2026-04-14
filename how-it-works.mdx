@@ -1,0 +1,168 @@
+---
+title: "How room manages request queues and concurrent slots"
+description: "Walkthrough of room's ticket counter, serving window, semaphore, reaper, and poll-driven admission — from first request to admitted handler."
+---
+
+`room` admits requests using a ticket-ordered capacity gate built from three cooperating primitives: a monotonically increasing ticket counter that stamps every arrival, a serving window that defines which tickets are currently eligible, and a semaphore that enforces the concurrent slot limit. Clients whose tickets fall outside the window receive a waiting room page and poll for admission — there are no server-side goroutines blocking on their behalf.
+
+## Admission model
+
+Every incoming request goes through the following decision path:
+
+```text
+            ┌─────────────────────────────────────────────────────┐
+            │                  Incoming Request                   │
+            └─────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+                 ┌────────────────┐
+                 │  Issue Ticket  │  nextTicket.Add(1)
+                 └───────┬────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐     YES    ┌──────────────┐
+              │  ticket ≤ nowServing │ ──────────▶ │ Acquire Slot │
+              │      + cap?         │             │  (fast path) │
+              └──────────┬──────────┘             └──────┬───────┘
+                         │ NO                            │
+                         ▼                               ▼
+              ┌──────────────────────┐          ┌────────────────┐
+              │  Serve Waiting Room  │          │   Run Handler  │
+              │  + Issue Cookie      │          │   defer Release│
+              └──────────┬──────────┘          └────────────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  Has room_pass?      │──YES──▶ autoPromote
+              │  (VIP pass cookie)   │         (jump to front)
+              └──────────┬──────────┘
+                         │ NO
+                         ▼
+              ┌──────────────────────┐
+              │  Client Polls        │  GET /queue/status
+              │  /queue/status       │  every 3s + jitter
+              └──────────┬──────────┘
+                         │ ready=true
+                         ▼
+              ┌──────────────────────┐
+              │  Client Reloads      │  Browser auto-redirects
+              │  → Fast Path         │  with cookie → admitted
+              └──────────────────────┘
+```
+
+### Fast path
+
+When a request arrives and `ticket ≤ nowServing + cap`, the ticket falls within the serving window. The middleware calls `sem.AcquireWith(ctx)` to claim a slot and calls `c.Next()` immediately. The handler runs normally; `defer wr.release("")` returns the slot and advances `nowServing` when the handler completes.
+
+### Slow path
+
+When a request arrives and its ticket exceeds the serving window, the middleware:
+
+1. Generates a 128-bit cryptographically random hex token.
+2. Stores the `{ticket, issuedAt}` pair in the token store keyed by that token.
+3. Sets the `room_ticket` cookie (`HttpOnly`, `SameSite=Lax`, 30-minute TTL).
+4. Serves the waiting room HTML page with the client's current position injected.
+5. Calls `c.Abort()` — the request is complete; no handler runs.
+
+The client's browser then polls `GET /queue/status` every 3 seconds. Each poll refreshes the token's `issuedAt` timestamp (sliding TTL window) and returns the current position. When `ready=true` is returned, the page reloads and the re-entering request hits the fast path.
+
+## Architecture layers
+
+| Layer | Responsibility |
+|---|---|
+| **Ticket counter** (`nextTicket`) | Monotonically increasing `atomic.Int64`. Every request increments it on arrival, establishing absolute FIFO order. |
+| **Serving window** (`nowServing + cap`) | `nowServing` advances by 1 each time a slot is released. Any ticket `≤ nowServing + cap` is eligible for immediate admission. |
+| **Semaphore** | [sema](https://github.com/andreimerlescu/sema) enforces the concurrent slot limit. `AcquireWith(ctx)` respects client disconnection via context cancellation. |
+| **Token store** | Maps `room_ticket` cookie values to `{ticket, issuedAt, lastPoll, promoted}` entries. Protected by a `sync.RWMutex`. |
+| **Pass store** | Maps `room_pass` cookie values to `{expiresAt}` entries. Separate from the token store because passes outlive individual queue tickets. |
+| **Reaper** | Background goroutine that evicts expired tokens and passes on a configurable interval (default 5 minutes, min 5 seconds, max 24 hours). Advances `nowServing` past ghost tickets. |
+| **Callbacks** | Event registry (`On`/`Off`/`emit`) that fires lifecycle events asynchronously in separate goroutines, keeping the hot path unblocked. |
+| **Promoter** | Serialized ticket reassignment (`PromoteToken`, `PromoteTokenToFront`) with a `promoteMu` mutex and a monotonic `promoteInsert` counter that guarantees unique ticket numbers under concurrent promotions. |
+
+## Cookie-based session
+
+Every queued client is identified by the `room_ticket` cookie. The cookie is:
+
+- **Name:** `room_ticket`
+- **Value:** 32-character hex string (128 bits of entropy from `crypto/rand`)
+- **TTL:** 30 minutes, implemented as a sliding window — each `/queue/status` poll resets the expiry
+- **Flags:** `HttpOnly`, `SameSite=Lax`; `Secure` is set when `wr.SetSecureCookie(true)` is called or when `c.Request.TLS != nil`
+
+The `room_pass` cookie follows the same format but with the duration set by `SetPassDuration` (1 minute to 24 hours). It is checked independently of the ticket cookie and survives across queue entries.
+
+<Info>Cookies are scoped to `Path: "/"` by default. Use `wr.SetCookiePath` and `wr.SetCookieDomain` to restrict scope in multi-app deployments.</Info>
+
+## Reaper: evicting ghost tickets
+
+A ghost ticket is a token whose client has navigated away, closed the tab, or timed out before being admitted. Without cleanup, ghost tickets occupy positions in the serving window indefinitely, stalling all clients behind them.
+
+The reaper runs as a background goroutine started by `Init`. On each cycle it:
+
+1. Scans the token store in batches of 1,000 for entries where `time.Since(issuedAt) > 30m`.
+2. Deletes the expired entries under a write lock with a double-checked expiry to close TOCTOU races.
+3. For each evicted token whose ticket was **outside** the serving window (`ticket > nowServing + cap`), increments `nowServing` by 1. Tickets inside the window already hold a semaphore allocation — advancing for them would inflate capacity.
+4. Sweeps the pass store for expired VIP passes.
+5. Fires `EventEvict` with a snapshot of the room's state.
+
+Because active pollers have their `issuedAt` refreshed on each `/queue/status` call, only genuinely abandoned clients are reaped.
+
+```go
+// Tighten the reaper for a high-traffic event (minimum: 5s).
+if err := wr.SetReaperInterval(30 * time.Second); err != nil {
+    log.Fatal(err)
+}
+```
+
+<Warning>Tightening the reaper interval increases write-lock contention on the token store. For most workloads the default 5-minute interval is appropriate. Use a shorter interval only when ghost tickets are measurably stalling your queue.</Warning>
+
+## Poll-driven admission
+
+`room` uses a poll-driven admission model rather than a push-driven one. There are no server-side goroutines blocking on behalf of individual waiting clients. The flow is:
+
+1. Client receives the waiting room HTML page and begins polling `GET /queue/status` every 3 seconds (with jitter in the default page's JavaScript).
+2. Each poll reads the token store, checks the current serving window, and returns a JSON payload with `ready`, `position`, and `utilization`.
+3. When `ready=true`, the browser reloads the original URL. The re-entering request presents the `room_ticket` cookie, finds its entry in the token store, sees its ticket is now within the window, and takes the fast path.
+
+A per-token rate limit on `/queue/status` rejects polls faster than 1 per second with `429 Too Many Requests` and a `Retry-After: 1` header, preventing poll abuse without impacting normal clients.
+
+## Serving window formula
+
+The position formula used consistently across `StatusHandler` and `Middleware` is:
+
+```text
+position = ticket - nowServing - cap
+```
+
+- A result `≤ 0` means the ticket is within the serving window and eligible for immediate admission.
+- A result `> 0` is the client's display position in the queue (clamped to a minimum of 1 for display).
+
+This single formula is the sole authoritative implementation, preventing the two call sites from silently diverging.
+
+## Lifecycle events
+
+All state transitions fire events through the callback registry. Handlers run asynchronously — each in its own goroutine — so a slow handler never stalls the request path.
+
+| Event | Fires when | Trigger type |
+|---|---|---|
+| `EventEnter` | Request acquires a semaphore slot | Per-admission |
+| `EventExit` | Request completes, slot released | Per-completion |
+| `EventFull` | Room transitions from below capacity to full | Edge (once per transition) |
+| `EventDrain` | Room transitions from full to available | Edge (once per transition) |
+| `EventQueue` | Request is issued a waiting room ticket | Per-queued request |
+| `EventEvict` | Reaper removes an abandoned token | Per-reap cycle |
+| `EventTimeout` | Client context cancelled before admission | Per-timeout |
+| `EventPromote` | Token moved forward via payment or VIP pass | Per-promotion |
+
+`EventFull` and `EventDrain` fire only on the transition edge, not on every admission while at capacity. This means an autoscaler callback fires once per traffic spike, not thousands of times.
+
+```go
+wr.On(room.EventFull, func(s room.Snapshot) {
+    log.Printf("room full: %d/%d active, %d queued",
+        s.Occupancy, s.Capacity, s.QueueDepth)
+    go provisionHost()
+})
+
+wr.On(room.EventDrain, func(s room.Snapshot) {
+    go deregisterHost()
+})
+```

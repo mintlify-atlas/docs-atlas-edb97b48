@@ -1,0 +1,225 @@
+---
+title: "Configuring the room waiting room at init and runtime"
+description: "All setters for capacity, queue limits, reaper interval, cookie security, and skip-the-line pricing — safe to call while traffic is actively in flight."
+---
+
+`room` is designed for zero-downtime configuration changes. Every setter listed here is safe to call while the waiting room is running and actively serving traffic. Changing capacity opens or drains slots immediately. Changing the reaper interval restarts the background goroutine without stopping the waiting room. There are no restarts, no locks held across requests, and no inconsistent intermediate states.
+
+## Default values
+
+| Setting | Default | Setter |
+|---|---|---|
+| Capacity | _user-supplied at `Init`_ | `SetCap` |
+| Max queue depth | `0` (unlimited) | `SetMaxQueueDepth` |
+| Reaper interval | `5m` | `SetReaperInterval` |
+| Secure cookie | `false` | `SetSecureCookie` |
+| Cookie path | `"/"` | `SetCookiePath` |
+| Cookie domain | `""` (request host) | `SetCookieDomain` |
+| Custom HTML | `nil` (embedded default) | `SetHTML` |
+| Skip-the-line rate | `nil` (disabled) | `SetRateFunc` |
+| Skip URL | `""` (disabled) | `SetSkipURL` |
+| Pass duration | `0` (disabled) | `SetPassDuration` |
+
+## Capacity
+
+`SetCap` adjusts the number of concurrently active requests. Expanding capacity opens new semaphore slots immediately — queued clients start being admitted on their next poll. Shrinking capacity drains gracefully: in-flight requests finish normally, and no new admissions occur until occupancy drops below the new limit.
+
+```go
+// Read the current capacity.
+cap := wr.Cap() // int32
+
+// Adjust at runtime — takes effect immediately.
+if err := wr.SetCap(1000); err != nil {
+    // ErrInvalidCap if cap < 1
+    log.Fatal(err)
+}
+```
+
+Valid range: any value ≥ 1 up to `math.MaxInt32`.
+
+## Queue depth limit
+
+`SetMaxQueueDepth` sets a circuit breaker on the waiting room queue. When the queue is at this depth, new arrivals receive `503 Service Unavailable` immediately instead of being queued, preventing unbounded memory growth during traffic spikes.
+
+```go
+// Reject new arrivals with 503 when more than 10,000 clients are waiting.
+if err := wr.SetMaxQueueDepth(10000); err != nil {
+    log.Fatal(err)
+}
+
+// Read the current limit.
+limit := wr.MaxQueueDepth() // int64; 0 means unlimited
+```
+
+`0` disables the limit (default). Negative values return `ErrInvalidMaxQueueDepth`.
+
+## Reaper interval
+
+The reaper evicts expired tokens from the token store and advances `nowServing` past ghost tickets. Tightening the interval reduces the window in which an abandoned client can stall the queue; loosening it reduces lock contention on the token store.
+
+```go
+// Default: 5 minutes.
+// Valid range: 5 seconds – 24 hours.
+if err := wr.SetReaperInterval(30 * time.Second); err != nil {
+    // ErrReaperInterval if outside [5s, 24h]
+    log.Fatal(err)
+}
+
+interval := wr.ReaperInterval() // time.Duration
+```
+
+The reaper goroutine picks up the new interval immediately without restarting the waiting room.
+
+## Cookie security
+
+### Secure flag
+
+```go
+// Default: false (plain-HTTP local dev works without configuration).
+// Production deployments served over HTTPS must set this to true.
+wr.SetSecureCookie(true)
+```
+
+Set `true` for any deployment behind TLS — including TLS-terminating proxies (Cloudflare, nginx, AWS ALB) where `c.Request.TLS` may be `nil` even though the end-user connection is encrypted.
+
+### Cookie path
+
+Restricts which URL paths the `room_ticket` and `room_pass` cookies are sent to. Use this in multi-app deployments that share a domain but mount apps at different path prefixes.
+
+```go
+// Default: "/"
+wr.SetCookiePath("/app")
+
+path := wr.CookiePath() // string
+```
+
+An empty string is silently normalized to `"/"`.
+
+### Cookie domain
+
+Sets the `Domain` attribute on session cookies. Leave empty (the default) to scope cookies to the exact request host. Set a leading dot to share cookies across subdomains.
+
+```go
+// Default: "" (browser uses the request host)
+wr.SetCookieDomain(".example.com") // shared across subdomains
+
+domain := wr.CookieDomain() // string
+```
+
+## Custom HTML
+
+Replace the embedded waiting room page with your own. The custom HTML is served to every queued client. Pass `nil` to revert to the embedded default.
+
+```go
+html, err := os.ReadFile("my_waiting_room.html")
+if err != nil {
+    log.Fatal(err)
+}
+wr.SetHTML(html)
+
+// Revert to the embedded default.
+wr.SetHTML(nil)
+```
+
+Your HTML may use two template placeholders:
+
+| Placeholder | Replaced with |
+|---|---|
+| `{{.Position}}` | The client's numeric queue position |
+| `{{.SkipURL}}` | The payment URL (empty string if not configured) |
+
+Your JavaScript should poll `GET /queue/status` and react to these JSON fields: `ready`, `position`, `skip_cost`, `rate_per_pos`, `has_pass`.
+
+## Skip-the-line
+
+Both `SetRateFunc` and `SetSkipURL` must be configured for the purchase offer to appear on the waiting room page.
+
+```go
+// Per-position pricing function. Receives current queue depth.
+wr.SetRateFunc(func(depth int64) float64 {
+    return 1.00 + float64(depth)*0.05
+})
+
+// URL of your payment page. "Pay to skip" button navigates here.
+wr.SetSkipURL("/queue/purchase")
+
+// Read the current skip URL.
+url := wr.SkipURL() // string
+```
+
+Set `RateFunc` to `nil` to disable promotions:
+
+```go
+wr.SetRateFunc(nil) // PromoteToken returns ErrPromotionDisabled
+```
+
+See [skip-the-line guide](/guides/skip-the-line) for the full payment flow.
+
+## VIP pass duration
+
+When non-zero, every promotion automatically issues a time-limited VIP pass that auto-promotes the client on re-entry.
+
+```go
+// Enable 90-minute VIP passes.
+if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+    // ErrPassDuration if outside [1m, 24h] and non-zero
+    log.Fatal(err)
+}
+
+// Disable — back to single-use promotions.
+wr.SetPassDuration(0)
+
+duration := wr.PassDuration() // time.Duration; 0 means disabled
+```
+
+Valid range when non-zero: **1 minute to 24 hours**.
+
+See [VIP passes guide](/guides/vip-passes) for pass lifecycle details.
+
+## Runtime capacity adjustment
+
+Change capacity in response to an admin API call without restarting:
+
+```go
+r.POST("/admin/cap", func(c *gin.Context) {
+    var body struct {
+        Cap int32 `json:"cap"`
+    }
+    if err := c.ShouldBindJSON(&body); err != nil {
+        c.Status(http.StatusBadRequest)
+        return
+    }
+    if err := wr.SetCap(body.Cap); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{
+        "cap":         wr.Cap(),
+        "occupancy":   wr.Len(),
+        "queue_depth": wr.QueueDepth(),
+        "utilization": wr.UtilizationSmoothed(),
+    })
+})
+```
+
+```bash
+# Double capacity — queued requests rush into the new slots.
+curl -X POST localhost:8080/admin/cap -d '{"cap":1000}'
+```
+
+## Config reload pattern
+
+Wire all setters to your configuration reload handler. Every call is safe while traffic is flowing:
+
+```go
+func onConfigReload(cfg Config) {
+    wr.SetCap(int32(cfg.MaxConcurrent))
+    wr.SetReaperInterval(cfg.ReaperInterval)
+    wr.SetMaxQueueDepth(cfg.MaxQueueDepth)
+    wr.SetPassDuration(cfg.PassDuration)
+}
+```
+
+<Tip>
+Register lifecycle callbacks before calling `RegisterRoutes` so no events are missed during startup. Callbacks themselves can be registered or removed at any time, but handlers registered after the first `EventFull` transition will miss that event.
+</Tip>

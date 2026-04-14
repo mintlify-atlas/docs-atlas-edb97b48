@@ -1,0 +1,86 @@
+---
+title: "room: FIFO waiting room middleware for Go + Gin apps"
+description: "room queues excess Gin requests in FIFO order, shows clients their live position, and admits them automatically as slots open — no dropped requests."
+---
+
+`room` is a single-import Go middleware for [Gin](https://github.com/gin-gonic/gin) that converts traffic spikes into an orderly waiting room. When your application reaches capacity, every excess request receives a ticket, sees its queue position update in real time, and is admitted automatically the moment a slot opens — no dropped requests, no blind retries, no infrastructure changes required.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Add a waiting room to your Gin app in under 5 minutes with three lines of setup code.
+  </Card>
+  <Card title="How it works" icon="diagram-project" href="/how-it-works">
+    Understand the ticket counter, serving window, semaphore, and reaper internals.
+  </Card>
+  <Card title="Skip the line" icon="credit-card" href="/guides/skip-the-line">
+    Let clients pay to jump the queue with configurable flat or surge pricing.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/waiting-room">
+    Complete reference for every method, type, and event in the public API.
+  </Card>
+</CardGroup>
+
+## Why a waiting room?
+
+When your application hits capacity you have three choices. Only one of them keeps users calm and eliminates blind retries.
+
+| Strategy | What happens | User experience |
+|---|---|---|
+| **Drop (429)** | Reject the request immediately | User sees an error, retries at random, amplifies the spike |
+| **Blind queue** | Buffer with no ordering guarantee | No position awareness, no ETA — users refresh and make it worse |
+| **Waiting room** | Issue a ticket, show live position, admit in FIFO order | User waits calmly, knows their place, gets in automatically |
+
+`room` implements the third strategy behind a single middleware call. Your handlers never change — they see normal requests arriving at the rate you configure.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="FIFO ordering" icon="arrow-down-1-9">
+    Monotonically increasing ticket counter ensures every client is admitted in the exact order it arrived. No starvation, no randomness.
+  </Card>
+  <Card title="Live position tracking" icon="gauge">
+    The built-in waiting room page polls `GET /queue/status` every 3 seconds and updates the queue position in place — no refresh required.
+  </Card>
+  <Card title="Zero handler changes" icon="circle-check">
+    The middleware gates traffic before your handlers run. Route logic, response formats, and middleware chains stay exactly as they are.
+  </Card>
+  <Card title="Ghost ticket reaper" icon="ghost">
+    A background goroutine evicts abandoned tokens on a configurable interval (default 5 minutes), advancing the queue past stalled positions.
+  </Card>
+  <Card title="Skip-the-line payments" icon="bolt">
+    Clients can pay a per-position fee to jump the queue. The price updates in real time as the queue moves. Integrates with any payment provider.
+  </Card>
+  <Card title="VIP passes" icon="star">
+    After a paid promotion, clients receive a time-limited pass. On re-entry they are silently auto-promoted — no second payment required.
+  </Card>
+  <Card title="Lifecycle callbacks" icon="bell">
+    Edge-triggered events (`EventFull`, `EventDrain`, `EventEnter`, `EventExit`, and more) fire asynchronously for autoscaling and observability.
+  </Card>
+  <Card title="Runtime configuration" icon="sliders">
+    Capacity, reaper interval, queue depth limit, and cookie settings are all safe to adjust while traffic is flowing — no restart required.
+  </Card>
+</CardGroup>
+
+## Installation
+
+Install with `go get`. No configuration files, no external services, no infrastructure.
+
+```bash
+go get github.com/andreimerlescu/room
+```
+
+<Info>Requires **Go 1.22+** and [github.com/gin-gonic/gin](https://github.com/gin-gonic/gin). The only transitive dependency is [sema](https://github.com/andreimerlescu/sema), the semaphore implementation that backs the concurrent slot limit.</Info>
+
+## Minimal setup
+
+Three lines of setup code is all that is required. The 501st concurrent request sees the waiting room; every earlier request passes through unmodified.
+
+```go
+wr := &room.WaitingRoom{}
+wr.Init(500)      // max 500 concurrent requests
+defer wr.Stop()   // clean shutdown, no leaked goroutines
+wr.RegisterRoutes(r)
+// Every route registered after this line is gated.
+```
+
+<Tip>Ready to integrate? Jump to the [quickstart](/quickstart) for a complete working `main.go` with step-by-step instructions.</Tip>

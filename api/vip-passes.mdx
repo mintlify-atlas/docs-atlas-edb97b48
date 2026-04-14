@@ -1,0 +1,173 @@
+---
+title: "VIP pass API — GrantPass and HasValidPass functions"
+description: "Issue time-limited VIP passes after a skip-the-line purchase. Passes auto-promote clients on queue re-entry for the configured duration without repayment."
+---
+
+VIP passes give promoted clients a persistent fast-lane for subsequent visits. After a client pays to move to the front of the queue, `PromoteToken` can issue a pass token that is stored in the `room_pass` cookie. On every subsequent request, `Middleware` checks this cookie via `HasValidPass` and silently promotes the client again — no payment required until the pass expires. Passes are separate from queue tickets: they survive across page reloads, tab closes, and re-entries.
+
+## Configuration
+
+### SetPassDuration
+
+```go
+func (wr *WaitingRoom) SetPassDuration(d time.Duration) error
+```
+
+Enables VIP passes and sets their lifetime. Call this before traffic starts. Calling it with `0` disables passes; `PromoteToken` will then return an empty `PassToken` and promotions become single-use.
+
+<ParamField path="d" type="time.Duration" required>
+  Pass lifetime. Use `0` to disable passes. When non-zero, must be between `1 minute` and `24 hours` (inclusive). Values outside this range return `ErrPassDuration`.
+</ParamField>
+
+```go setup.go
+wr := &room.WaitingRoom{}
+wr.Init(500)
+
+// Issue passes valid for 2 hours after a skip-the-line purchase.
+if err := wr.SetPassDuration(2 * time.Hour); err != nil {
+    log.Fatal(err)
+}
+```
+
+<Warning>
+`ErrPassDuration` is returned for any non-zero duration outside `[1m, 24h]`. A value like `30 * time.Second` is rejected even though it is positive.
+</Warning>
+
+### PassDuration
+
+```go
+func (wr *WaitingRoom) PassDuration() time.Duration
+```
+
+Returns the currently configured pass lifetime. Returns `0` when passes are disabled. Use this when setting `MaxAge` on the `room_pass` cookie in your own handlers.
+
+---
+
+## Issuing passes
+
+### GrantPass
+
+```go
+func (wr *WaitingRoom) GrantPass() string
+```
+
+Creates a new VIP pass and returns the pass token. The token is a cryptographically random 32-character hex string (128 bits of entropy). The pass is stored in the internal `passStore` with an `expiresAt` of `time.Now().Add(PassDuration())`.
+
+Returns an empty string if `PassDuration()` is `0` (passes disabled). No pass entry is created in that case.
+
+The caller is responsible for setting the `room_pass` cookie on the HTTP response. `PromoteToken` calls `GrantPass` automatically and returns the token in `PromoteResult.PassToken`, so you only need to call `GrantPass` directly if you are issuing passes outside of the promotion flow.
+
+```go grant_pass_manual.go
+// Manually issue a pass (e.g., for admin-granted or loyalty passes).
+passToken := wr.GrantPass()
+if passToken != "" {
+    http.SetCookie(w, &http.Cookie{
+        Name:     "room_pass",
+        Value:    passToken,
+        Path:     wr.CookiePath(),
+        MaxAge:   int(wr.PassDuration().Seconds()),
+        HttpOnly: true,
+        Secure:   true,
+        SameSite: http.SameSiteLaxMode,
+    })
+}
+```
+
+<Tip>
+Always set `HttpOnly: true` and `Secure: true` on the `room_pass` cookie in production. The pass token grants queue-bypass privileges and should not be accessible to JavaScript or transmitted over plain HTTP.
+</Tip>
+
+---
+
+## Checking pass validity
+
+### HasValidPass
+
+```go
+func (wr *WaitingRoom) HasValidPass(passToken string) bool
+```
+
+Returns `true` if the token exists in the pass store **and** has not expired. Expired passes are lazily evicted on read — the `passStore.get` method deletes the entry while still holding the write lock, so no separate cleanup step is needed in the hot path.
+
+Returns `false` for an empty string without a store lookup.
+
+```go middleware_check.go
+// Check whether an incoming request carries a valid VIP pass.
+func checkPass(wr *room.WaitingRoom, c *gin.Context) bool {
+    passToken, err := c.Cookie("room_pass")
+    if err != nil {
+        return false
+    }
+    return wr.HasValidPass(passToken)
+}
+```
+
+---
+
+## Middleware integration
+
+`Middleware` checks the `room_pass` cookie on every request before evaluating queue position. If `HasValidPass` returns `true`, the middleware calls the internal `autoPromote` function, which moves the client to the front of the queue silently. The next poll of `/queue/status` will reflect the new position and the response will include `has_pass: true`.
+
+The client never needs to interact with the promotion API directly — the pass cookie is the only signal `Middleware` needs.
+
+---
+
+## Cookie settings reference
+
+Set these attributes on the `room_pass` cookie when writing it in your Gin handlers:
+
+```go set_pass_cookie.go
+c.SetCookie(
+    "room_pass",            // name: passCookieName constant
+    result.PassToken,       // value: from PromoteResult.PassToken or GrantPass()
+    int(wr.PassDuration().Seconds()), // MaxAge: matches pass lifetime
+    wr.CookiePath(),        // Path: respects SetCookiePath()
+    wr.CookieDomain(),      // Domain: respects SetCookieDomain()
+    true,                   // Secure: always true in production
+    true,                   // HttpOnly: prevent JS access
+)
+```
+
+---
+
+## Pass lifecycle
+
+The table below summarises the full lifecycle of a VIP pass from issuance to expiry.
+
+| Stage | What happens |
+|---|---|
+| **Client pays** | Your payment handler calls `PromoteTokenToFront`. `PromoteToken` internally calls `GrantPass()` and returns `PassToken` in `PromoteResult`. |
+| **Cookie set** | Your handler writes `room_pass=<PassToken>` to the response with `HttpOnly`, `Secure`, and `MaxAge = PassDuration`. |
+| **Re-entry** | On the next request, `Middleware` reads `room_pass`, calls `HasValidPass`, and auto-promotes if valid. `/queue/status` returns `has_pass: true`; no pricing is shown. |
+| **Pass expires** | After `PassDuration` elapses, `HasValidPass` returns `false`. The browser cookie also expires (same `MaxAge`). The client re-enters the queue normally and must pay again. |
+| **Reaper sweep** | The background reaper calls `passStore.reap()` on every cycle (default every `5 minutes`). All passes past their `expiresAt` are deleted, keeping memory bounded. |
+
+---
+
+## Pass store reaper
+
+The `passStore` is swept by the background reaper on the same interval as the token store (default `5 minutes`, configurable via `SetReaperInterval`). The `reap` method acquires a write lock and deletes every entry where `time.Now().After(entry.expiresAt)`. Passes are also lazily evicted on read in `HasValidPass`, so expired passes do not accumulate between reaper cycles under normal load.
+
+---
+
+## /queue/status behaviour with an active pass
+
+When a client presents a valid `room_pass` cookie, `StatusHandler` sets `has_pass: true` in the response and **omits** `skip_cost` and `rate_per_pos`. There is no reason to show pricing to a client who already holds a pass.
+
+```json status response with active pass
+{
+  "ready": false,
+  "position": 7,
+  "utilization": 0.64,
+  "has_pass": true
+}
+```
+
+---
+
+## Related
+
+- [`PromoteToken`](/api/promote) — promotes a token and issues a pass automatically
+- [`SetRateFunc`](/api/promote) — required to enable the promotion system
+- [`GET /queue/status`](/api/queue-status) — how `has_pass` affects the polling response
+- [`SetReaperInterval`](/api/configuration) — control how often expired passes are swept

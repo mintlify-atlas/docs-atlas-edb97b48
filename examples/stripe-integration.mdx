@@ -1,0 +1,302 @@
+---
+title: "Stripe Checkout integration for skip-the-line payments"
+description: "Implement Stripe Checkout to let queued users pay for priority admission in a Gin waiting room, including webhook handling and VIP pass cookies."
+---
+
+This page walks through a complete Stripe Checkout integration for the skip-the-line feature. When a user lands in the waiting room, they see a live price for jumping to the front. Clicking "Pay to skip" sends them to your `/queue/purchase` handler, which creates a Stripe Checkout session. After payment, Stripe fires a webhook that calls `PromoteTokenToFront` and stores the resulting `PassToken` server-side. The client's next page load sets the `room_pass` cookie, granting a time-limited VIP pass that auto-promotes them on any future queue entry without a second payment.
+
+## Prerequisites
+
+Enable skip-the-line by configuring a `RateFunc`, a `SkipURL`, and an optional pass duration. Both `SetRateFunc` and `SetSkipURL` must be set for the "Pay to skip" card to appear on the waiting room page.
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+// $2.50 flat rate per position. Position 40 → position 1 costs $97.50.
+wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
+
+// Where the "Pay to skip" button sends the client.
+// This route must be registered BEFORE RegisterRoutes.
+wr.SetSkipURL("/queue/purchase")
+
+// Pay once, skip for 90 minutes on any re-entry.
+if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+    log.Fatal(err)
+}
+```
+
+For surge pricing — a rate that rises with queue pressure — pass a depth-aware function instead:
+
+```go
+// Base $1.00 + 5¢ per person waiting.
+// Queue of 100 → $6.00/position. Queue of 10 → $1.50/position.
+wr.SetRateFunc(func(depth int64) float64 {
+    return 1.00 + float64(depth)*0.05
+})
+```
+
+## Route registration order
+
+<Warning>
+Register `/queue/purchase` (and any other payment or webhook routes) **before** calling `wr.RegisterRoutes(r)`. Routes registered after `RegisterRoutes` are gated by the waiting room middleware. A queued user trying to access the payment page would be sent back to the queue — making payment impossible.
+</Warning>
+
+```go
+// ✓ Payment routes first — bypass the waiting room.
+r.GET("/queue/purchase",          handlePurchasePage)
+r.POST("/stripe/webhook",         handleStripeWebhook)
+r.GET("/queue/purchase/success",  handlePurchaseSuccess)
+
+// Then install the waiting room. Every route after this is gated.
+wr.RegisterRoutes(r)
+
+// Application routes — protected.
+r.GET("/", homePage)
+r.GET("/about", aboutPage)
+```
+
+## Full integration
+
+<Steps>
+  <Step title="GET /queue/purchase — create the Checkout session">
+    Read the `room_ticket` cookie to identify the queued client, call `QuoteCost` to get the live price, then create a Stripe Checkout session with `client_reference_id` set to the ticket token. Stripe will return this value in the webhook, letting you link the payment back to the correct queue position.
+
+    ```go
+    r.GET("/queue/purchase", func(c *gin.Context) {
+        cookie, err := c.Request.Cookie("room_ticket")
+        if err != nil {
+            c.Status(http.StatusBadRequest)
+            return
+        }
+
+        // QuoteCost is a read-only snapshot — no state changes.
+        cost, err := wr.QuoteCost(cookie.Value, 1)
+        if err != nil {
+            // Possible errors:
+            //   room.ErrPromotionDisabled — no RateFunc configured
+            //   room.ErrTokenNotFound     — ticket expired or already admitted
+            //   room.ErrAlreadyAdmitted   — client is already in the serving window
+            c.AbortWithStatus(http.StatusBadRequest)
+            return
+        }
+
+        session, err := stripe.CheckoutSessions.New(&stripe.CheckoutSessionParams{
+            LineItems: []*stripe.CheckoutSessionLineItemParams{{
+                PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+                    Currency:   stripe.String("usd"),
+                    UnitAmount: stripe.Int64(int64(cost * 100)), // Stripe uses cents
+                    ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+                        Name: stripe.String("Skip the line"),
+                    },
+                },
+                Quantity: stripe.Int64(1),
+            }},
+            Mode:              stripe.String("payment"),
+            ClientReferenceID: stripe.String(cookie.Value), // links payment → token
+            SuccessURL:        stripe.String("https://example.com/queue/purchase/success"),
+            CancelURL:         stripe.String("https://example.com/"),
+        })
+        if err != nil {
+            c.AbortWithStatus(http.StatusInternalServerError)
+            return
+        }
+
+        c.Redirect(http.StatusSeeOther, session.URL)
+    })
+    ```
+
+    <Note>
+      The price displayed on the waiting room page polls `/queue/status` every 3 seconds and updates `skip_cost` in real time. By the time the user clicks through, the queue may have moved — `QuoteCost` always returns the current price at call time.
+    </Note>
+  </Step>
+
+  <Step title="POST /stripe/webhook — verify and promote">
+    Stripe delivers `checkout.session.completed` to your webhook endpoint. Verify the signature to reject forged events, extract `client_reference_id` (the room ticket token), call `PromoteTokenToFront`, and store the resulting `PassToken` server-side keyed by the token. The success URL handler will pick it up on the client's next page load.
+
+    ```go
+    r.POST("/stripe/webhook", func(c *gin.Context) {
+        payload, err := io.ReadAll(c.Request.Body)
+        if err != nil {
+            c.Status(http.StatusBadRequest)
+            return
+        }
+
+        // Always verify the webhook signature.
+        // stripeWebhookSecret is loaded from your environment at startup.
+        event, err := webhook.ConstructEvent(
+            payload,
+            c.GetHeader("Stripe-Signature"),
+            stripeWebhookSecret,
+        )
+        if err != nil {
+            // Signature mismatch — reject the request.
+            c.Status(http.StatusBadRequest)
+            return
+        }
+
+        if event.Type != "checkout.session.completed" {
+            c.Status(http.StatusOK) // acknowledge unrelated events
+            return
+        }
+
+        var session stripe.CheckoutSession
+        if err := json.Unmarshal(event.Data.Raw, &session); err != nil {
+            c.Status(http.StatusBadRequest)
+            return
+        }
+
+        token := session.ClientReferenceID
+
+        result, err := wr.PromoteTokenToFront(token)
+        if err != nil {
+            // Token may have expired between purchase and webhook delivery.
+            log.Printf("promotion failed for token=%.8s...: %v", token, err)
+            c.Status(http.StatusOK) // still return 200 so Stripe doesn't retry
+            return
+        }
+
+        log.Printf("promoted token=%.8s... for $%.2f", token, result.Cost)
+
+        // Stripe webhooks run server-side — they cannot set cookies on the
+        // client's browser. Store the PassToken and serve it from the
+        // success URL handler instead.
+        if result.PassToken != "" {
+            storePassForClient(token, result.PassToken)
+        }
+
+        c.Status(http.StatusOK)
+    })
+    ```
+
+    <Warning>
+      Always call `webhook.ConstructEvent` (or the equivalent for your Stripe client library) before acting on a webhook payload. Skipping signature verification allows attackers to forge promotion requests without paying.
+    </Warning>
+  </Step>
+
+  <Step title="GET /queue/purchase/success — set the pass cookie">
+    Stripe redirects the browser to your `SuccessURL` after the Checkout session completes. This is the earliest point where you can set a cookie on the client's browser. Look up the stored `PassToken` by the client's `room_ticket` value and set `room_pass`.
+
+    ```go
+    r.GET("/queue/purchase/success", func(c *gin.Context) {
+        cookie, err := c.Request.Cookie("room_ticket")
+        if err != nil {
+            // No ticket — client may have already been admitted.
+            c.Redirect(http.StatusSeeOther, "/")
+            return
+        }
+
+        // Retrieve the PassToken stored by the webhook handler.
+        passToken := retrievePassForClient(cookie.Value)
+        if passToken != "" {
+            http.SetCookie(c.Writer, &http.Cookie{
+                Name:     "room_pass",
+                Value:    passToken,
+                Path:     wr.CookiePath(),
+                Domain:   wr.CookieDomain(),
+                MaxAge:   int(wr.PassDuration().Seconds()),
+                HttpOnly: true,
+                Secure:   true,
+                SameSite: http.SameSiteLaxMode,
+            })
+        }
+
+        // Redirect to the site. The next poll will return ready=true
+        // and the browser will reload into the fast path.
+        c.Redirect(http.StatusSeeOther, "/")
+    })
+    ```
+  </Step>
+</Steps>
+
+## Handling PromoteResult
+
+`PromoteTokenToFront` returns a `PromoteResult` containing the computed charge and the VIP pass token:
+
+```go
+type PromoteResult struct {
+    Cost      float64 // price at promotion time (distance × rate)
+    PassToken string  // VIP pass token; empty if SetPassDuration was not called
+}
+```
+
+Log `Cost` for revenue tracking and pass it to your billing records. `PassToken` is only non-empty when `SetPassDuration` is configured with a non-zero duration — if you call `SetPassDuration(0)` (the default), promotions are single-use and `PassToken` is always empty.
+
+```go
+result, err := wr.PromoteTokenToFront(token)
+if err != nil { ... }
+
+// Revenue tracking.
+log.Printf("queue jump: token=%.8s... cost=$%.2f", token, result.Cost)
+metrics.Add("stripe.revenue_usd", result.Cost)
+
+// Issue the VIP pass if configured.
+if result.PassToken != "" {
+    storePassForClient(token, result.PassToken)
+}
+```
+
+## Partial skips
+
+`PromoteToken` lets you offer a cheaper partial skip — moving the client to position 10 instead of position 1, for example. `PromoteTokenToFront` is a convenience wrapper that always targets position 1.
+
+```go
+// Jump from wherever they are to position 10.
+result, err := wr.PromoteToken(token, 10)
+
+// Jump all the way to the front.
+result, err := wr.PromoteTokenToFront(token)
+```
+
+Use `QuoteCost` with different target positions to show a pricing menu before the client commits:
+
+```go
+costToFront, _ := wr.QuoteCost(token, 1)   // full skip
+costToTen, _   := wr.QuoteCost(token, 10)  // partial skip
+```
+
+## Tracking promotions with lifecycle callbacks
+
+Register an `EventPromote` callback to record every skip-the-line event for analytics or alerting:
+
+```go
+wr.On(room.EventPromote, func(s room.Snapshot) {
+    metrics.Inc("room.promote")
+    log.Printf("queue jump — depth now %d, occupancy %d/%d",
+        s.QueueDepth, s.Occupancy, s.Capacity)
+})
+```
+
+Callbacks run asynchronously in their own goroutines and never block the request path. The `Snapshot` delivered to the callback is a point-in-time copy safe to retain after the handler returns.
+
+## storePassForClient pattern
+
+The webhook and success handler need a shared store. A simple in-memory map with a mutex is sufficient for single-instance deployments; use Redis or another shared store for multi-instance:
+
+```go
+var (
+    passStoreMu sync.Mutex
+    passStore   = map[string]string{} // token → passToken
+)
+
+func storePassForClient(token, passToken string) {
+    passStoreMu.Lock()
+    passStore[token] = passToken
+    passStoreMu.Unlock()
+}
+
+func retrievePassForClient(token string) string {
+    passStoreMu.Lock()
+    defer passStoreMu.Unlock()
+    pt := passStore[token]
+    delete(passStore, token) // consume once
+    return pt
+}
+```
+
+<Tip>
+  In a multi-instance deployment, the Stripe webhook may land on a different server than the client's browser. Store pass tokens in Redis keyed by the room ticket token so any instance can retrieve them at the success URL.
+</Tip>

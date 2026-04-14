@@ -1,0 +1,252 @@
+---
+title: "Autoscaling your Gin app with room lifecycle events"
+description: "Use room's edge-triggered EventFull and EventDrain callbacks to drive cloud scaling operations and maintain throughput under variable load."
+---
+
+This page shows how to use `room`'s lifecycle events to drive autoscaling decisions without polling, without a sidecar, and without coupling your scaling logic to the middleware hot path. Every callback fires asynchronously in its own goroutine — a slow provisioning call never stalls a request. The events are **edge-triggered**: `EventFull` fires once when the room transitions from below capacity to fully occupied, and `EventDrain` fires once when it transitions back — not on every admission or release while the room is full.
+
+## Event overview
+
+| Event | Fires when | Autoscaling use |
+|---|---|---|
+| `EventFull` | Room transitions from below capacity to fully occupied (once per edge) | Trigger scale-out |
+| `EventDrain` | Room transitions from full back to having at least one free slot (once per edge) | Signal scale-in is safe |
+| `EventEnter` | A request acquires a semaphore slot | Throughput metrics |
+| `EventExit` | A request completes and releases its slot | Latency tracking |
+| `EventQueue` | A request is issued a waiting-room ticket | Queue depth alerting |
+| `EventEvict` | The reaper removes an abandoned token | Ghost-ticket monitoring |
+| `EventTimeout` | A queued request's context is cancelled before admission | Client timeout tracking |
+| `EventPromote` | A client is promoted via payment or VIP pass | Revenue tracking |
+
+Every callback receives a `Snapshot` — a point-in-time copy of the room's state at the moment the event fired:
+
+```go
+type Snapshot struct {
+    Event      room.Event
+    Occupancy  int   // slots currently in use
+    Capacity   int   // maximum concurrent slots
+    QueueDepth int64 // requests waiting for a slot
+}
+
+func (s Snapshot) Full()  bool // Occupancy >= Capacity
+func (s Snapshot) Empty() bool // Occupancy == 0
+```
+
+The snapshot is safe to retain after the callback returns — it is a value copy, not a pointer into live state.
+
+## Scale out on EventFull
+
+Register an `EventFull` callback to provision capacity when the room saturates. The callback fires once at the transition edge — not 10,000 times during a sustained spike — so your provisioning logic won't be called repeatedly while the room stays full:
+
+```go
+wr.On(room.EventFull, func(s room.Snapshot) {
+    log.Printf("room full (%d/%d) queue=%d — provisioning new host",
+        s.Occupancy, s.Capacity, s.QueueDepth)
+    go provisionHost() // non-blocking: starts the provisioning flow
+})
+```
+
+A typical `provisionHost` implementation for AWS Auto Scaling:
+
+```go
+func provisionHost() {
+    svc := autoscaling.New(sess)
+    _, err := svc.SetDesiredCapacity(&autoscaling.SetDesiredCapacityInput{
+        AutoScalingGroupName: aws.String(os.Getenv("ASG_NAME")),
+        DesiredCapacity:      aws.Int64(currentDesired + 1),
+    })
+    if err != nil {
+        log.Printf("scale-out failed: %v", err)
+    }
+}
+```
+
+<Note>
+  `EventFull` fires only on the **transition edge** — the single moment the last free slot is taken. It does not fire again on subsequent admissions while the room is already full. This means your autoscaler callback fires once when you need it, not thousands of times during a traffic spike.
+</Note>
+
+## Scale in on EventDrain
+
+`EventDrain` fires once when the room drops below full capacity — the first slot becomes free after the room was completely occupied. Use it to signal that scale-in is safe:
+
+```go
+wr.On(room.EventDrain, func(s room.Snapshot) {
+    log.Printf("room draining (%d/%d) queue=%d — deregistering host",
+        s.Occupancy, s.Capacity, s.QueueDepth)
+    go deregisterHost()
+})
+```
+
+<Warning>
+  Check `s.QueueDepth` before deregistering. If the queue is still deep when `EventDrain` fires, the room may fill again immediately. Consider only scaling in when `s.QueueDepth == 0`.
+</Warning>
+
+```go
+wr.On(room.EventDrain, func(s room.Snapshot) {
+    if s.QueueDepth > 0 {
+        log.Printf("draining but queue still deep (%d) — holding capacity", s.QueueDepth)
+        return
+    }
+    go deregisterHost()
+})
+```
+
+## Runtime capacity adjustment
+
+Change capacity without restarting the server. Wire up an admin endpoint — register it **before** `RegisterRoutes` so it bypasses the waiting room:
+
+```go
+r.POST("/admin/cap", func(c *gin.Context) {
+    var body struct{ Cap int32 `json:"cap"` }
+    if err := c.ShouldBindJSON(&body); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    if err := wr.SetCap(body.Cap); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{
+        "cap":         wr.Cap(),
+        "occupancy":   wr.Len(),
+        "queue_depth": wr.QueueDepth(),
+        "utilization": wr.UtilizationSmoothed(),
+    })
+})
+```
+
+```bash
+# Double capacity — queued requests rush into the new slots immediately
+curl -X POST localhost:8080/admin/cap \
+     -H 'Content-Type: application/json' \
+     -d '{"cap":1000}'
+```
+
+`SetCap` takes effect immediately. Expanding capacity opens new semaphore slots and queued requests start being admitted on their next poll. Shrinking drains gracefully — in-flight requests finish normally, and no new requests are admitted beyond the reduced cap.
+
+## UtilizationSmoothed for feedback loops
+
+`UtilizationSmoothed()` returns the EWMA-smoothed ratio of active requests to capacity. It is sub-nanosecond — safe to call from hot dashboards and autoscaler feedback loops without adding latency:
+
+```go
+util := wr.UtilizationSmoothed() // 0.0 – 1.0, EWMA-smoothed
+```
+
+Use it to implement a PID-style feedback loop that adjusts capacity proportionally rather than reacting to a single spike:
+
+```go
+func autoAdjustCap(wr *room.WaitingRoom, targetUtil float64) {
+    util := wr.UtilizationSmoothed()
+    currentCap := wr.Cap()
+
+    switch {
+    case util > 0.90 && wr.QueueDepth() > 0:
+        // High utilization with a queue building — increase cap by 20%.
+        newCap := int32(float64(currentCap) * 1.20)
+        if err := wr.SetCap(newCap); err != nil {
+            log.Printf("SetCap(%d) failed: %v", newCap, err)
+        }
+        log.Printf("scaled up: cap %d→%d util=%.0f%%", currentCap, newCap, util*100)
+
+    case util < 0.40 && wr.QueueDepth() == 0:
+        // Low utilization, no queue — reduce cap by 10%.
+        newCap := int32(float64(currentCap) * 0.90)
+        if newCap < 1 {
+            newCap = 1
+        }
+        if err := wr.SetCap(newCap); err != nil {
+            log.Printf("SetCap(%d) failed: %v", newCap, err)
+        }
+        log.Printf("scaled down: cap %d→%d util=%.0f%%", currentCap, newCap, util*100)
+    }
+}
+```
+
+Prefer `UtilizationSmoothed()` over `Utilization()` for any control loop. The raw `Utilization()` value is instantaneous and can oscillate rapidly under bursty traffic; the smoothed value filters transient spikes and gives a stable signal.
+
+## Config reload pattern
+
+Every setter on `WaitingRoom` is safe to call while traffic is flowing. Use this to apply a config reload without restarting the server:
+
+```go
+func onConfigReload(cfg Config) {
+    wr.SetCap(int32(cfg.MaxConcurrent))
+    wr.SetReaperInterval(cfg.ReaperInterval)
+    wr.SetMaxQueueDepth(cfg.MaxQueueDepth)
+    wr.SetPassDuration(cfg.PassDuration)
+}
+```
+
+Wire this to a SIGHUP handler or a config-watch goroutine to apply changes without dropping in-flight requests.
+
+## Putting it all together
+
+A complete setup combining lifecycle callbacks, runtime capacity adjustment, and utilization-based scaling:
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+// Scale out when the room saturates.
+wr.On(room.EventFull, func(s room.Snapshot) {
+    log.Printf("FULL: occupancy=%d/%d queue=%d — triggering scale-out",
+        s.Occupancy, s.Capacity, s.QueueDepth)
+    go provisionHost()
+})
+
+// Scale in only when the queue has cleared.
+wr.On(room.EventDrain, func(s room.Snapshot) {
+    if s.QueueDepth > 0 {
+        return
+    }
+    log.Printf("DRAIN: occupancy=%d/%d queue=0 — safe to scale in",
+        s.Occupancy, s.Capacity)
+    go deregisterHost()
+})
+
+// Observe every admission for throughput metrics.
+wr.On(room.EventEnter, func(s room.Snapshot) {
+    metrics.Inc("room.enter")
+})
+
+// Observe every completion for latency tracking.
+wr.On(room.EventExit, func(s room.Snapshot) {
+    metrics.Inc("room.exit")
+})
+
+// Alert on deep queue depth.
+wr.On(room.EventQueue, func(s room.Snapshot) {
+    if s.QueueDepth > 1000 {
+        alerts.Fire("room.queue_depth_high", s.QueueDepth)
+    }
+})
+
+// Admin endpoint for runtime capacity adjustment.
+// Register BEFORE wr.RegisterRoutes so it bypasses the waiting room.
+r.POST("/admin/cap", func(c *gin.Context) {
+    var body struct{ Cap int32 `json:"cap"` }
+    c.ShouldBindJSON(&body)
+    wr.SetCap(body.Cap)
+    c.JSON(http.StatusOK, gin.H{
+        "cap":         wr.Cap(),
+        "occupancy":   wr.Len(),
+        "queue_depth": wr.QueueDepth(),
+        "utilization": wr.UtilizationSmoothed(),
+    })
+})
+
+wr.RegisterRoutes(r)
+```
+
+## Removing callbacks
+
+Use `wr.Off(event)` to remove all handlers for an event. Handlers that are already executing are not interrupted — `Off` only prevents future invocations:
+
+```go
+// Remove the scale-out handler after provisioning completes and
+// the new host has joined the pool.
+wr.Off(room.EventFull)
+```

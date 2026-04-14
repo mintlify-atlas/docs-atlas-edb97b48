@@ -1,0 +1,298 @@
+---
+title: "Types reference — structs, interfaces, and aliases"
+description: "Public types in room: WaitingRoom, Snapshot, PromoteResult, RateFunc, CallbackFunc, Event, and the statusResponse JSON shape served by /queue/status."
+---
+
+The `room` package exports a small, focused set of types. Every public API surface is covered here — from the central `WaitingRoom` struct that owns all state, to the lightweight value types that flow through callbacks and promotion results. Internal types that influence observable behaviour (like `statusResponse`, which shapes the `/queue/status` JSON) are documented where relevant.
+
+---
+
+## WaitingRoom
+
+`WaitingRoom` is a ticket-ordered capacity gate for Gin HTTP handlers. It combines a semaphore (capacity management) with a ticket queue (arrival tracking) so that requests at capacity wait in FIFO order and are served automatically as slots open.
+
+```go
+type WaitingRoom struct { /* unexported fields */ }
+```
+
+<Note>
+The zero value is **not usable**. Always construct via `NewWaitingRoom` (one-liner, panics on error) or initialise manually with `Init` (full error handling and lifecycle control).
+</Note>
+
+```go
+// One-liner — panics on invalid cap.
+room.NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc
+
+// Full control — returns error, caller owns lifecycle.
+wr := &room.WaitingRoom{}
+if err := wr.Init(cap int32); err != nil { log.Fatal(err) }
+defer wr.Stop()
+```
+
+All methods on `WaitingRoom` are safe for concurrent use unless documented otherwise.
+
+---
+
+## Snapshot
+
+`Snapshot` is a point-in-time view of the waiting room delivered to every lifecycle callback. All fields are copied at trigger time — the struct is safe to retain, send to a channel, or pass to another goroutine after the callback returns.
+
+```go
+type Snapshot struct {
+    Event      Event  // the lifecycle event that produced this snapshot
+    Occupancy  int    // slots in use at event time
+    Capacity   int    // maximum slots allowed
+    QueueDepth int64  // requests waiting for a slot
+}
+
+func (s Snapshot) Full() bool  // Occupancy >= Capacity
+func (s Snapshot) Empty() bool // Occupancy == 0
+```
+
+<ResponseField name="Event" type="Event">
+  The lifecycle event that triggered this snapshot. One of the eight `EventXxx` constants.
+</ResponseField>
+
+<ResponseField name="Occupancy" type="int">
+  Number of semaphore slots in use at the exact moment the event fired. `Occupancy <= Capacity` always holds.
+</ResponseField>
+
+<ResponseField name="Capacity" type="int">
+  Maximum number of concurrent occupants. Reflects the capacity at event time — can change at runtime via `SetCap`.
+</ResponseField>
+
+<ResponseField name="QueueDepth" type="int64">
+  Count of requests currently waiting for a slot. Zero when no clients are in the waiting room.
+</ResponseField>
+
+### Methods
+
+<ResponseField name="Full()" type="bool">
+  Returns `true` when `Occupancy >= Capacity`. Convenience predicate — equivalent to checking the fields directly.
+</ResponseField>
+
+<ResponseField name="Empty()" type="bool">
+  Returns `true` when `Occupancy == 0`. No slots are currently in use.
+</ResponseField>
+
+---
+
+## PromoteResult
+
+`PromoteResult` is returned by `PromoteToken` and `PromoteTokenToFront`. It carries the computed cost of the promotion and, when VIP passes are configured, the pass token to set on the client's response.
+
+```go
+type PromoteResult struct {
+    Cost      float64 // computed price at promotion time
+    PassToken string  // VIP pass token; empty if SetPassDuration == 0
+}
+```
+
+<ResponseField name="Cost" type="float64">
+  The price computed at promotion time, calculated as `distance × rate` where `distance` is the number of positions skipped and `rate` is the value returned by `RateFunc` at the current queue depth.
+</ResponseField>
+
+<ResponseField name="PassToken" type="string">
+  A randomly generated VIP pass token to set as the `room_pass` cookie on the HTTP response. Empty when `SetPassDuration` has not been called or is set to zero. When non-empty, the middleware will auto-promote the client on subsequent queue entries without requiring another payment, for the configured pass duration.
+</ResponseField>
+
+<Tip>
+Always check `PassToken != ""` before setting the cookie — when passes are disabled, the field is the empty string and setting an empty cookie is a no-op at best.
+</Tip>
+
+```go
+result, err := wr.PromoteTokenToFront(token)
+if err != nil {
+    // handle error — see errors.mdx
+}
+
+log.Printf("promoted for $%.2f", result.Cost)
+
+if result.PassToken != "" {
+    http.SetCookie(w, &http.Cookie{
+        Name:     "room_pass",
+        Value:    result.PassToken,
+        Path:     wr.CookiePath(),
+        MaxAge:   int(wr.PassDuration().Seconds()),
+        HttpOnly: true,
+        Secure:   true,
+    })
+}
+```
+
+---
+
+## RateFunc
+
+`RateFunc` is the pricing function used by `QuoteCost` and `PromoteToken`. It receives the current queue depth and returns the per-position cost. The total promotion cost is `distance × RateFunc(queueDepth)`.
+
+```go
+type RateFunc func(queueDepth int64) float64
+```
+
+<ParamField path="queueDepth" type="int64">
+  The current number of requests waiting for a slot at the time of the quote or promotion.
+</ParamField>
+
+Configure it with `SetRateFunc`. If no `RateFunc` is set, `QuoteCost` and `PromoteToken` return `ErrPromotionDisabled`.
+
+<Tabs>
+  <Tab title="Flat rate">
+    ```go
+    // $1.00 per position regardless of queue depth.
+    wr.SetRateFunc(func(depth int64) float64 {
+        return 1.00
+    })
+    ```
+  </Tab>
+  <Tab title="Surge pricing">
+    ```go
+    // Base $1.00 + 5¢ per person in the queue.
+    // Queue of 100 → $6.00/position. Queue of 10 → $1.50/position.
+    wr.SetRateFunc(func(depth int64) float64 {
+        return 1.00 + float64(depth)*0.05
+    })
+    ```
+  </Tab>
+  <Tab title="Tiered pricing">
+    ```go
+    // Fixed tiers based on queue depth.
+    wr.SetRateFunc(func(depth int64) float64 {
+        switch {
+        case depth < 50:
+            return 0.50
+        case depth < 200:
+            return 1.50
+        default:
+            return 3.00
+        }
+    })
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## CallbackFunc
+
+`CallbackFunc` is the function signature for all lifecycle callbacks registered via `On`:
+
+```go
+type CallbackFunc func(snap Snapshot)
+```
+
+<ParamField path="snap" type="Snapshot">
+  A point-in-time copy of room state at the moment the event fired. Safe to retain beyond the call.
+</ParamField>
+
+Each registered handler is invoked in its own goroutine — slow callbacks never stall the middleware hot path. See [Lifecycle events](/api/events) for the full event reference and `On`/`Off` documentation.
+
+---
+
+## Event
+
+`Event` is a `uint8` type identifying a lifecycle moment in the waiting room's operation. Eight named constants are defined:
+
+```go
+type Event uint8
+
+const (
+    EventEnter   Event = iota // 0 — request acquires a slot
+    EventExit                 // 1 — request releases a slot
+    EventFull                 // 2 — room transitions to full (edge)
+    EventDrain                // 3 — room transitions from full (edge)
+    EventQueue                // 4 — request issued a ticket
+    EventEvict                // 5 — reaper removes expired token
+    EventTimeout              // 6 — context cancelled before admission
+    EventPromote              // 7 — token promoted via payment or VIP pass
+)
+
+func (e Event) String() string // returns canonical name, e.g. "Enter", "Full"
+```
+
+Use `Event` values as the first argument to `On` and `Off`. For full per-event documentation including fire conditions and use cases, see [Lifecycle events](/api/events).
+
+---
+
+## statusResponse (internal)
+
+`statusResponse` is the internal struct serialised as JSON by the `/queue/status` endpoint. It is not exported, but its shape defines the contract your waiting-room page's JavaScript should consume.
+
+```go
+type statusResponse struct {
+    Ready       bool    `json:"ready"`
+    Position    int64   `json:"position,omitempty"`
+    Utilization float64 `json:"utilization,omitempty"`
+    SkipCost    float64 `json:"skip_cost,omitempty"`
+    RatePerPos  float64 `json:"rate_per_pos,omitempty"`
+    HasPass     bool    `json:"has_pass,omitempty"`
+}
+```
+
+<ResponseField name="ready" type="bool">
+  `true` when the client's ticket is within the serving window. The waiting-room page reloads automatically when this transitions to `true`.
+</ResponseField>
+
+<ResponseField name="position" type="int64" optional>
+  The client's current queue position. Omitted when `ready` is `true`.
+</ResponseField>
+
+<ResponseField name="utilization" type="float64" optional>
+  Current utilization as a fraction of capacity (`Occupancy / Capacity`). Omitted when zero.
+</ResponseField>
+
+<ResponseField name="skip_cost" type="float64" optional>
+  The current cost for this client to jump to position 1. Omitted when `RateFunc` is not configured or the client already has a valid pass.
+</ResponseField>
+
+<ResponseField name="rate_per_pos" type="float64" optional>
+  The per-position rate returned by `RateFunc` at the current queue depth. Omitted when `RateFunc` is not configured.
+</ResponseField>
+
+<ResponseField name="has_pass" type="bool" optional>
+  `true` when the client has a valid, unexpired VIP pass. When `true`, `skip_cost` and `rate_per_pos` are omitted — the client already paid.
+</ResponseField>
+
+<Accordion title="Example status responses">
+
+Standard queued client:
+```json
+{
+  "ready": false,
+  "position": 42,
+  "utilization": 1.0,
+  "skip_cost": 102.50,
+  "rate_per_pos": 2.50
+}
+```
+
+Client with a VIP pass:
+```json
+{
+  "ready": false,
+  "position": 3,
+  "has_pass": true
+}
+```
+
+Client ready to be admitted:
+```json
+{
+  "ready": true
+}
+```
+
+</Accordion>
+
+---
+
+## Type summary
+
+| Type | Kind | Purpose |
+|---|---|---|
+| `WaitingRoom` | struct | Central state owner; capacity gate + ticket queue |
+| `Snapshot` | struct | Point-in-time room state delivered to callbacks |
+| `PromoteResult` | struct | Promotion cost and optional VIP pass token |
+| `RateFunc` | func alias | Per-position pricing for skip-the-line |
+| `CallbackFunc` | func alias | Lifecycle event handler signature |
+| `Event` | uint8 | Identifies one of eight lifecycle moments |

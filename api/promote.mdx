@@ -1,0 +1,238 @@
+---
+title: "Queue promotion — QuoteCost and PromoteToken reference"
+description: "Skip-the-line API: get a real-time price quote for a queue position, then promote a token to that position after payment is verified."
+---
+
+The promotion system lets waiting clients pay to move ahead in the queue. `QuoteCost` returns the current price for a given jump without touching any state — use it to display a price on your payment page. After you verify payment, call `PromoteToken` or `PromoteTokenToFront` to reassign the client's ticket to the target position. The two functions are intentionally separate: `room` never handles money, and `PromoteToken` must not be called until payment is confirmed.
+
+## Enabling promotions
+
+Promotions are disabled by default. Call `SetRateFunc` with a non-nil function before accepting payments. Call it with `nil` to disable promotions at runtime.
+
+### RateFunc
+
+```go
+type RateFunc func(queueDepth int64) float64
+```
+
+`RateFunc` receives the current number of waiting tokens and returns the per-position cost. Implement any pricing strategy you need:
+
+<CodeGroup>
+
+```go flat rate
+// $1.00 per position, regardless of queue depth
+wr.SetRateFunc(func(depth int64) float64 {
+    return 1.00
+})
+```
+
+```go surge pricing
+// Price rises with queue depth: base $0.50 + $0.01 per waiting token
+wr.SetRateFunc(func(depth int64) float64 {
+    return 0.50 + float64(depth)*0.01
+})
+```
+
+```go tiered pricing
+// Three tiers based on queue length
+wr.SetRateFunc(func(depth int64) float64 {
+    switch {
+    case depth < 50:
+        return 0.25
+    case depth < 200:
+        return 1.00
+    default:
+        return 2.50
+    }
+})
+```
+
+</CodeGroup>
+
+### SetRateFunc
+
+```go
+func (wr *WaitingRoom) SetRateFunc(fn RateFunc)
+```
+
+Sets the per-position pricing function. Pass `nil` to disable promotions. Safe to call at any time, including while requests are in flight — the function is stored atomically.
+
+---
+
+## QuoteCost
+
+```go
+func (wr *WaitingRoom) QuoteCost(token string, targetPosition int64) (float64, error)
+```
+
+Returns the cost for a queued client to jump to `targetPosition`. This is a **read-only** operation: no state is modified and no ticket is reassigned. Call it on your payment page to display the current price before the client commits to a purchase.
+
+Because queue depth changes continuously, the price shown to the user may differ slightly from the price at the moment `PromoteToken` executes. Design your payment flow to re-quote if the gap matters for your use case.
+
+### Parameters
+
+<ParamField path="token" type="string" required>
+  The value of the client's `room_ticket` cookie. Read this from the incoming request on your payment page.
+</ParamField>
+
+<ParamField path="targetPosition" type="int64" required>
+  The desired queue position after promotion. Must be `≥ 1`. Position `1` means next to be admitted. If `targetPosition` is already at or ahead of the client's current position, `QuoteCost` returns `0, nil`.
+</ParamField>
+
+### Return values
+
+| Value | Description |
+|---|---|
+| `float64` | Computed cost: `(currentPosition − targetPosition) × RateFunc(queueDepth)` |
+| `error` | Non-nil on any of the error conditions listed below |
+
+### Errors
+
+| Error type | Message | When it occurs | How to handle |
+|---|---|---|---|
+| `ErrPromotionDisabled` | `room: promotions disabled — call SetRateFunc first` | No `RateFunc` is configured | Call `SetRateFunc` before accepting quote requests |
+| `ErrTokenNotFound` | `room: token not found` | Token has expired, been admitted, or never existed | Return a 404 or redirect to the queue |
+| `ErrAlreadyAdmitted` | `room: token already within serving window` | The client is already being served | Redirect the client to their original destination |
+| `ErrInvalidTargetPosition` | `room: invalid target position N: must be >= 1` | `targetPosition < 1` | Validate input; `targetPosition` must be at least `1` |
+
+---
+
+## PromoteToken
+
+```go
+func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (PromoteResult, error)
+```
+
+Moves the token's ticket to `targetPosition` in the queue. **You must verify payment before calling this.** `PromoteToken` does not process payments — it only reassigns the ticket.
+
+Promotions are serialized by an internal mutex (`promoteMu`). Only one `PromoteToken` call executes at a time, preventing two concurrent promotions from claiming the same ticket slot. Each successive promotion to the same target position is placed one position behind the previous promotee, guaranteed by the `promoteInsert` counter.
+
+When `SetPassDuration` is configured with a non-zero duration, `PromoteToken` calls `GrantPass()` automatically and returns the pass token in `PromoteResult.PassToken`. You must set this as the `room_pass` cookie on the HTTP response.
+
+### Parameters
+
+<ParamField path="token" type="string" required>
+  The value of the client's `room_ticket` cookie.
+</ParamField>
+
+<ParamField path="targetPosition" type="int64" required>
+  Target queue position. Must be `≥ 1`. Position `1` = next admitted.
+</ParamField>
+
+### PromoteResult
+
+```go
+type PromoteResult struct {
+    Cost      float64 // price computed at promotion time
+    PassToken string  // VIP pass token; empty if passes are disabled
+}
+```
+
+<ResponseField name="Cost" type="float64">
+  The price charged at the moment of promotion, computed as `distance × RateFunc(queueDepth)`. This may differ from the `QuoteCost` value if the queue changed between quote and promotion.
+</ResponseField>
+
+<ResponseField name="PassToken" type="string">
+  A new VIP pass token to set as the `room_pass` cookie. Empty string if `SetPassDuration` was not called or is `0`. When non-empty, set this cookie on the response so the client is auto-promoted on future queue entries without paying again.
+</ResponseField>
+
+### Errors
+
+Same four error types as `QuoteCost`:
+
+| Error type | When it occurs |
+|---|---|
+| `ErrPromotionDisabled` | No `RateFunc` configured |
+| `ErrTokenNotFound` | Token expired, admitted, or unknown |
+| `ErrAlreadyAdmitted` | Token is already within the serving window |
+| `ErrInvalidTargetPosition` | `targetPosition < 1` |
+
+### Event
+
+`PromoteToken` fires the `EventPromote` callback after reassigning the ticket. Register a handler with `On(room.EventPromote, fn)` to log, audit, or notify.
+
+---
+
+## PromoteTokenToFront
+
+```go
+func (wr *WaitingRoom) PromoteTokenToFront(token string) (PromoteResult, error)
+```
+
+Convenience wrapper that calls `PromoteToken(token, 1)`. Use this when you always promote to position 1 and don't need configurable target positions.
+
+---
+
+## Full payment handler example
+
+The example below shows a complete Gin handler for a Stripe webhook that verifies payment and then promotes the client to the front of the queue.
+
+```go payment_handler.go
+func paymentSuccessHandler(wr *room.WaitingRoom) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        // 1. Read the room_ticket cookie to identify the waiting client.
+        ticketToken, err := c.Cookie("room_ticket")
+        if err != nil {
+            c.JSON(http.StatusBadRequest, gin.H{"error": "missing room_ticket cookie"})
+            return
+        }
+
+        // 2. (Optional) Quote the cost so you can record it before charging.
+        cost, err := wr.QuoteCost(ticketToken, 1)
+        if err != nil {
+            switch err.(type) {
+            case room.ErrAlreadyAdmitted:
+                // Client is already through — nothing to do.
+                c.Redirect(http.StatusSeeOther, "/")
+                return
+            case room.ErrTokenNotFound:
+                c.JSON(http.StatusGone, gin.H{"error": "queue position expired"})
+                return
+            default:
+                c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                return
+            }
+        }
+
+        // 3. Charge the customer (Stripe, crypto, etc.).
+        // ...your payment logic here...
+        _ = cost // record or pass to payment provider
+
+        // 4. After confirmed payment, promote to the front.
+        result, err := wr.PromoteTokenToFront(ticketToken)
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+            return
+        }
+
+        // 5. Set the VIP pass cookie if one was issued.
+        if result.PassToken != "" {
+            c.SetCookie(
+                "room_pass",
+                result.PassToken,
+                int(wr.PassDuration().Seconds()),
+                wr.CookiePath(),
+                wr.CookieDomain(),
+                true,  // Secure
+                true,  // HttpOnly
+            )
+        }
+
+        c.JSON(http.StatusOK, gin.H{
+            "promoted": true,
+            "cost":     result.Cost,
+        })
+    }
+}
+```
+
+<Note>
+`PromoteToken` must only be called after payment is fully confirmed and non-reversible. Calling it optimistically and then reversing on failure is not supported — there is no undo operation.
+</Note>
+
+## Related
+
+- [`SetPassDuration`](/api/vip-passes) — configure VIP pass lifetime
+- [`GrantPass`](/api/vip-passes) — issue a pass token manually
+- [`GET /queue/status`](/api/queue-status) — how `skip_cost` and `rate_per_pos` are surfaced to clients
+- [`SetSkipURL`](/api/configuration) — the URL the waiting-room page links to for payment

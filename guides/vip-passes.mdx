@@ -1,0 +1,161 @@
+---
+title: "VIP passes: durable auto-promotion across re-entries"
+description: "Configure time-limited VIP passes so clients who paid to skip are auto-promoted on every queue re-entry within the pass window, no second payment needed."
+---
+
+By default, a skip-the-line promotion is single-use: the client jumps to the front once, gets admitted, and if they return to the queue later they wait like everyone else. VIP passes change this. When `SetPassDuration` is configured, every call to `PromoteToken` or `PromoteTokenToFront` automatically creates a time-limited pass. On every subsequent request during the pass window, `room` detects the `room_pass` cookie and silently promotes the client to the front — no second payment required. The pass is enforced server-side, not just by cookie expiry.
+
+## Enabling VIP passes
+
+One setter is all that's required:
+
+```go
+// Pay once, skip for 90 minutes.
+if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+    log.Fatal(err)
+}
+```
+
+After this call, `PromoteToken` and `PromoteTokenToFront` include a non-empty `PassToken` in their result. Valid pass durations are **1 minute to 24 hours**. Pass `0` to disable passes and revert to single-use promotions.
+
+```go
+// Valid range: 1 minute – 24 hours.
+wr.SetPassDuration(1 * time.Minute)   // minimum
+wr.SetPassDuration(24 * time.Hour)    // maximum
+wr.SetPassDuration(0)                 // disable — back to single-use promotions
+
+// Check the current setting.
+if wr.PassDuration() > 0 {
+    log.Printf("VIP passes enabled: %s", wr.PassDuration())
+}
+```
+
+## Pass lifecycle
+
+| Stage | What happens |
+|---|---|
+| Payment confirmed | `PromoteTokenToFront` returns a non-empty `PassToken`; you set the `room_pass` cookie on the HTTP response |
+| Client admitted | Normal flow — pass is not consumed, just checked on each request |
+| Client re-enters queue | Middleware sees valid `room_pass` cookie, calls `autoPromote` silently |
+| Pass expires | `room_pass` cookie expires client-side; reaper sweeps the server-side `passStore` on the next cycle |
+| Client returns after expiry | Standard FIFO — must pay again to skip |
+
+## Setting the room_pass cookie
+
+After calling `PromoteTokenToFront`, set the `PassToken` as a cookie on the HTTP response. The middleware reads this cookie on every subsequent request.
+
+```go
+result, err := wr.PromoteTokenToFront(ticketToken)
+if err != nil {
+    c.Status(http.StatusBadRequest)
+    return
+}
+
+log.Printf("promoted for $%.2f", result.Cost)
+
+// Set the VIP pass cookie alongside the existing room_ticket cookie.
+if result.PassToken != "" {
+    http.SetCookie(c.Writer, &http.Cookie{
+        Name:     "room_pass",
+        Value:    result.PassToken,
+        Path:     wr.CookiePath(),
+        Domain:   wr.CookieDomain(),
+        MaxAge:   int(wr.PassDuration().Seconds()),
+        HttpOnly: true,
+        Secure:   true,
+    })
+}
+```
+
+<Note>
+Webhook-based payment providers (like Stripe) cannot set cookies directly — their HTTP call is server-to-server. Store `result.PassToken` keyed by the queue token, then apply the `room_pass` cookie in the success-URL handler when the client's browser loads the redirect page.
+</Note>
+
+## How auto-promotion works under the hood
+
+On every request, the middleware checks for the `room_pass` cookie before issuing or resuming a queue ticket:
+
+1. Client returns with a valid `room_pass` cookie and a new (or existing) `room_ticket`.
+2. Middleware calls `HasValidPass(passCookie.Value)` — a lock-free read against the server-side pass store.
+3. If valid, `autoPromote` is called immediately, reassigning the ticket to the front of the queue under `promoteMu`.
+4. The client sees the waiting room page for at most one poll cycle, then `/queue/status` returns `ready=true` and the browser reloads.
+
+This is transparent to the client — they see a brief wait, then admission. No second payment prompt ever appears.
+
+## GrantPass for explicit pass issuance
+
+`PromoteToken` and `PromoteTokenToFront` call `GrantPass` internally. You can also call `GrantPass` directly to issue a pass outside the promotion flow — for example, to grant complimentary access to certain users:
+
+```go
+// Issue a pass without requiring a queue promotion.
+passToken := wr.GrantPass()
+if passToken != "" {
+    http.SetCookie(c.Writer, &http.Cookie{
+        Name:     "room_pass",
+        Value:    passToken,
+        Path:     wr.CookiePath(),
+        MaxAge:   int(wr.PassDuration().Seconds()),
+        HttpOnly: true,
+        Secure:   true,
+    })
+}
+```
+
+`GrantPass` returns an empty string when `PassDuration` is zero (passes disabled). Check the return value before setting the cookie.
+
+## Checking pass status programmatically
+
+Use `HasValidPass` to check whether a given pass token is still valid. This performs a server-side expiry check — it does not trust the cookie's `MaxAge` alone.
+
+```go
+if wr.HasValidPass(passToken) {
+    log.Println("client has an active VIP pass")
+} else {
+    log.Println("pass expired or not found")
+}
+```
+
+`HasValidPass` is lock-free and safe to call from hot paths such as dashboard polling or autoscaler feedback loops.
+
+## Status endpoint behavior with an active pass
+
+When a client has a valid pass, the `/queue/status` response omits `skip_cost` and `rate_per_pos` — the client already paid. The `has_pass` field is set to `true`:
+
+```json
+{
+  "ready": false,
+  "position": 3,
+  "has_pass": true
+}
+```
+
+The default waiting room page reacts to `has_pass: true` by displaying a "VIP pass active" badge instead of the purchase offer card. If you supply custom HTML via `SetHTML`, your JavaScript should handle this field the same way:
+
+```javascript
+fetch("/queue/status")
+  .then(r => r.json())
+  .then(data => {
+    if (data.has_pass) {
+      document.getElementById("pass-badge").style.display = "block";
+      document.getElementById("purchase-offer").style.display = "none";
+    }
+    if (data.ready) {
+      window.location.reload();
+    }
+  });
+```
+
+## Server-side expiry enforcement
+
+<Warning>
+Pass expiry is enforced server-side, not just by cookie `MaxAge`. Even if a client manipulates or replays the `room_pass` cookie after expiry, the server checks the `passStore` on every request. Expired cookies are silently ignored and the client falls back to standard FIFO.
+</Warning>
+
+The reaper sweeps the `passStore` on every reap cycle (default every 5 minutes). Any pass whose `expiresAt` has passed is removed. You can tighten this window with `SetReaperInterval` during high-traffic periods:
+
+```go
+// Evict expired passes more aggressively during a flash sale.
+if err := wr.SetReaperInterval(30 * time.Second); err != nil {
+    log.Fatal(err)
+}
+```

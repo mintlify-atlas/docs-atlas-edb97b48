@@ -1,0 +1,364 @@
+---
+title: "room lifecycle events — callbacks, On, Off, Snapshot"
+description: "room fires 8 lifecycle events at key moments. Register handlers with On() and Off(), each running in its own goroutine with a point-in-time Snapshot."
+---
+
+`room` fires lifecycle events at key moments throughout the waiting room's operation — on admission, exit, capacity transitions, queuing, eviction, timeout, and promotion. Register handlers with `On()` to react in real time without polling, without a sidecar, and without coupling business logic to the middleware. Every handler receives a `Snapshot` — an immutable, point-in-time copy of room state — and runs in its own goroutine so that slow callbacks never stall the request hot path.
+
+## Event constants
+
+`Event` is a `uint8` type. Eight named constants are defined in registration order using `iota`:
+
+```go
+type Event uint8
+
+const (
+    EventEnter   Event = iota // 0
+    EventExit                 // 1
+    EventFull                 // 2
+    EventDrain                // 3
+    EventQueue                // 4
+    EventEvict                // 5
+    EventTimeout              // 6
+    EventPromote              // 7
+)
+```
+
+Each constant has a `String()` method that returns its canonical name for logging:
+
+```go
+func (e Event) String() string
+```
+
+| Return value | Event constant |
+|---|---|
+| `"Enter"` | `EventEnter` |
+| `"Exit"` | `EventExit` |
+| `"Full"` | `EventFull` |
+| `"Drain"` | `EventDrain` |
+| `"Queue"` | `EventQueue` |
+| `"Evict"` | `EventEvict` |
+| `"Timeout"` | `EventTimeout` |
+| `"Promote"` | `EventPromote` |
+
+## Event reference
+
+| Event | Value | Fires when | Primary use case |
+|---|---|---|---|
+| `EventEnter` | 0 | Request acquires a slot and enters active service | Throughput metrics |
+| `EventExit` | 1 | Request completes and releases its slot | Latency tracking |
+| `EventFull` | 2 | Room transitions from below capacity to full (edge only) | Scale-out trigger |
+| `EventDrain` | 3 | Room transitions from full to having a free slot (edge only) | Scale-in signal |
+| `EventQueue` | 4 | Request issued a waiting-room ticket | Queue depth alerting |
+| `EventEvict` | 5 | Reaper removes an expired token | Ghost ticket monitoring |
+| `EventTimeout` | 6 | Request context cancelled before admission | Client timeout tracking |
+| `EventPromote` | 7 | Client promoted via payment or VIP pass | Revenue tracking |
+
+<Note>
+`EventFull` and `EventDrain` are **edge-triggered**: they fire exactly once per transition. `EventFull` fires when the room moves from below capacity to full — not on every admission while full. `EventDrain` fires when the room moves from full back to having at least one free slot — not when it becomes completely empty. Your autoscaler callback fires once when you need it, not thousands of times during a traffic spike.
+</Note>
+
+### EventEnter
+
+Fires each time a request acquires a semaphore slot and is admitted into active service. Use this to track throughput or update external load-balancer weights.
+
+```go
+wr.On(room.EventEnter, func(s room.Snapshot) {
+    metrics.Inc("room.enter")
+    log.Printf("admitted: occupancy=%d/%d", s.Occupancy, s.Capacity)
+})
+```
+
+### EventExit
+
+Fires each time a request completes and releases its slot. Paired with `EventEnter`, it gives a complete picture of slot lifetime.
+
+```go
+wr.On(room.EventExit, func(s room.Snapshot) {
+    metrics.Inc("room.exit")
+})
+```
+
+### EventFull
+
+Fires once when every slot is occupied — on the transition edge from below capacity to full. Does **not** fire on every admission while the room is already full.
+
+```go
+wr.On(room.EventFull, func(s room.Snapshot) {
+    log.Printf("room full (%d/%d) — provisioning new host", s.Occupancy, s.Capacity)
+    go provisionHost()
+})
+```
+
+### EventDrain
+
+Fires once when the room transitions from full back to having at least one free slot. Does **not** fire when the room becomes completely empty — only on the full → available edge.
+
+```go
+wr.On(room.EventDrain, func(s room.Snapshot) {
+    log.Printf("room drained — queue depth now %d", s.QueueDepth)
+    go deregisterHost()
+})
+```
+
+### EventQueue
+
+Fires when an arriving request cannot be admitted immediately and is issued a waiting-room ticket.
+
+```go
+wr.On(room.EventQueue, func(s room.Snapshot) {
+    metrics.Gauge("room.queue_depth", float64(s.QueueDepth))
+})
+```
+
+### EventEvict
+
+Fires when the reaper removes an expired token from the token store. The associated ticket is considered abandoned.
+
+```go
+wr.On(room.EventEvict, func(s room.Snapshot) {
+    metrics.Inc("room.evict")
+    log.Printf("ghost ticket evicted — queue now %d", s.QueueDepth)
+})
+```
+
+### EventTimeout
+
+Fires when a queued request's context is cancelled or its deadline expires before a slot becomes available.
+
+```go
+wr.On(room.EventTimeout, func(s room.Snapshot) {
+    metrics.Inc("room.timeout")
+})
+```
+
+### EventPromote
+
+Fires when a queued token is promoted to a higher position via `PromoteToken` or `PromoteTokenToFront`. Use this to track revenue events or log queue jumps for fairness monitoring.
+
+```go
+wr.On(room.EventPromote, func(s room.Snapshot) {
+    metrics.Inc("room.skip_revenue")
+    log.Printf("queue jump — depth now %d", s.QueueDepth)
+})
+```
+
+---
+
+## Snapshot
+
+`Snapshot` is a point-in-time view of the waiting room delivered to every callback. All fields are copied at trigger time and are safe to read after the room's state has changed.
+
+```go
+type Snapshot struct {
+    Event      Event  // the lifecycle event that produced this snapshot
+    Occupancy  int    // slots in use at event time
+    Capacity   int    // maximum slots allowed
+    QueueDepth int64  // requests waiting for a slot
+}
+
+func (s Snapshot) Full() bool  // Occupancy >= Capacity
+func (s Snapshot) Empty() bool // Occupancy == 0
+```
+
+<ResponseField name="Event" type="Event">
+  The lifecycle event that produced this snapshot. Matches the event passed to `On`.
+</ResponseField>
+
+<ResponseField name="Occupancy" type="int">
+  Number of semaphore slots in use at the moment the event fired.
+</ResponseField>
+
+<ResponseField name="Capacity" type="int">
+  Maximum number of concurrent occupants allowed. Set by `Init` or `SetCap`.
+</ResponseField>
+
+<ResponseField name="QueueDepth" type="int64">
+  Number of requests currently waiting for a slot at the moment the event fired.
+</ResponseField>
+
+`Snapshot` is safe to retain beyond the callback invocation. The struct is copied by value at emit time — subsequent changes to room state do not affect a retained `Snapshot`.
+
+---
+
+## CallbackFunc
+
+`CallbackFunc` is the function signature for all lifecycle callbacks:
+
+```go
+type CallbackFunc func(snap Snapshot)
+```
+
+The `snap` argument is a value type — it is safe to store, pass to other goroutines, or retain indefinitely.
+
+---
+
+## On — registering handlers
+
+```go
+func (wr *WaitingRoom) On(event Event, fn CallbackFunc)
+```
+
+Registers `fn` to be called whenever `event` fires. Multiple handlers may be registered for the same event — all are invoked in registration order, each in its own goroutine.
+
+`On` is safe for concurrent use and may be called after the `WaitingRoom` is running.
+
+<ParamField path="event" type="Event" required>
+  The lifecycle event to listen for. Use one of the eight `EventXxx` constants.
+</ParamField>
+
+<ParamField path="fn" type="CallbackFunc" required>
+  The handler to call when the event fires. Receives a point-in-time `Snapshot`. Must not be nil.
+</ParamField>
+
+---
+
+## Off — removing handlers
+
+```go
+func (wr *WaitingRoom) Off(event Event)
+```
+
+Removes **all** handlers registered for `event`. Handlers that are already executing are not interrupted — `Off` only prevents future invocations.
+
+`Off` is safe for concurrent use.
+
+<ParamField path="event" type="Event" required>
+  The event whose handlers should be removed.
+</ParamField>
+
+---
+
+## Async execution model
+
+Each handler runs in its own goroutine, spawned by the internal `emit` function:
+
+```go
+func (wr *WaitingRoom) emit(event Event, snap Snapshot) {
+    // handlers are copied under RLock, then each is launched in a goroutine
+    for _, fn := range handlers {
+        go fn(snap)
+    }
+}
+```
+
+Consequences of this design:
+
+- A slow callback — one that calls a remote API, waits on a mutex, or blocks on I/O — **never stalls** the admission path.
+- Handlers for the same event fire **concurrently** with each other, even though they are registered and launched in order.
+- There is **no delivery guarantee** if the process exits mid-callback. For durable side effects, write to a channel or queue inside the handler.
+
+---
+
+## Code examples
+
+<Tabs>
+  <Tab title="Autoscaling">
+    ```go
+    // Scale out when the room fills up; scale in when pressure drops.
+    wr.On(room.EventFull, func(s room.Snapshot) {
+        log.Printf("room full (%d/%d) — provisioning new host", s.Occupancy, s.Capacity)
+        go provisionHost()
+    })
+
+    wr.On(room.EventDrain, func(s room.Snapshot) {
+        log.Printf("room drained — queue depth now %d", s.QueueDepth)
+        go deregisterHost()
+    })
+    ```
+  </Tab>
+  <Tab title="Metrics">
+    ```go
+    // Observe every admission and completion.
+    wr.On(room.EventEnter, func(s room.Snapshot) { metrics.Inc("room.enter") })
+    wr.On(room.EventExit,  func(s room.Snapshot) { metrics.Inc("room.exit") })
+
+    // React to queuing, abandoned tickets, and timeouts.
+    wr.On(room.EventQueue,   func(s room.Snapshot) { metrics.Inc("room.queue") })
+    wr.On(room.EventEvict,   func(s room.Snapshot) { metrics.Inc("room.evict") })
+    wr.On(room.EventTimeout, func(s room.Snapshot) { metrics.Inc("room.timeout") })
+
+    // Track skip-the-line revenue.
+    wr.On(room.EventPromote, func(s room.Snapshot) {
+        metrics.Inc("room.promote")
+        log.Printf("queue jump — depth now %d", s.QueueDepth)
+    })
+    ```
+  </Tab>
+  <Tab title="Removing handlers">
+    ```go
+    // Register a one-time handler, then deregister after first fire.
+    var once sync.Once
+    wr.On(room.EventFull, func(s room.Snapshot) {
+        once.Do(func() {
+            log.Println("first full event — sending alert")
+            sendPagerDutyAlert(s)
+            wr.Off(room.EventFull)
+        })
+    })
+    ```
+
+    <Note>
+      `Off` removes all handlers for the event. If you need to keep some handlers while removing others, re-register the ones you want to keep after calling `Off`.
+    </Note>
+  </Tab>
+  <Tab title="Retaining Snapshots">
+    ```go
+    // Snapshots are safe to send to channels or goroutines.
+    events := make(chan room.Snapshot, 64)
+
+    wr.On(room.EventFull,  func(s room.Snapshot) { events <- s })
+    wr.On(room.EventDrain, func(s room.Snapshot) { events <- s })
+
+    go func() {
+        for s := range events {
+            log.Printf("event=%s occupancy=%d/%d queue=%d",
+                s.Event, s.Occupancy, s.Capacity, s.QueueDepth)
+        }
+    }()
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Complete setup example
+
+```go
+package main
+
+import (
+    "log"
+
+    "github.com/andreimerlescu/room"
+    "github.com/gin-gonic/gin"
+)
+
+func main() {
+    r := gin.Default()
+
+    wr := &room.WaitingRoom{}
+    if err := wr.Init(500); err != nil {
+        log.Fatal(err)
+    }
+    defer wr.Stop()
+
+    // Register all lifecycle hooks before traffic arrives.
+    wr.On(room.EventFull, func(s room.Snapshot) {
+        log.Printf("room full (%d/%d)", s.Occupancy, s.Capacity)
+        go provisionHost()
+    })
+    wr.On(room.EventDrain, func(s room.Snapshot) {
+        go deregisterHost()
+    })
+    wr.On(room.EventEnter,   func(s room.Snapshot) { metrics.Inc("room.enter") })
+    wr.On(room.EventExit,    func(s room.Snapshot) { metrics.Inc("room.exit") })
+    wr.On(room.EventQueue,   func(s room.Snapshot) { metrics.Inc("room.queue") })
+    wr.On(room.EventEvict,   func(s room.Snapshot) { metrics.Inc("room.evict") })
+    wr.On(room.EventTimeout, func(s room.Snapshot) { metrics.Inc("room.timeout") })
+    wr.On(room.EventPromote, func(s room.Snapshot) { metrics.Inc("room.promote") })
+
+    wr.RegisterRoutes(r)
+    r.Run(":8080")
+}
+```

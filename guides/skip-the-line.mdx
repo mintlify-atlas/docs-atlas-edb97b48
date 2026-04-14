@@ -1,0 +1,244 @@
+---
+title: "Skip-the-line: paid queue jumping for room and Gin"
+description: "Let clients pay to skip positions in the waiting room using flat or surge pricing, then call PromoteTokenToFront after payment confirmation to admit them."
+---
+
+Skip-the-line lets you monetize queue pressure. When `room` is configured with a pricing function and a payment URL, the waiting room page shows a live "Skip the line" offer — the price updates on every poll so clients see exactly what it costs to jump at that moment. After your payment provider confirms the charge, a single `PromoteTokenToFront` call moves the client to the front. The entire flow is opt-in: if you don't call `SetRateFunc` and `SetSkipURL`, the offer never appears.
+
+## How it works
+
+`room` computes the skip cost as `distance × rate`, where distance is the number of positions between the client's current spot and their target, and rate is what your `RateFunc` returns given the current queue depth. `QuoteCost` reads this without changing any state — safe to call on every status poll to show a live price. `PromoteTokenToFront` (or `PromoteToken` for a partial skip) performs the actual reassignment after you have verified payment.
+
+Both `SetRateFunc` **and** `SetSkipURL` must be configured for the offer to appear. Configuring only one silently suppresses the card on the waiting room page.
+
+```go
+type RateFunc func(queueDepth int64) float64
+```
+
+### Pricing models
+
+**Flat pricing** — constant cost regardless of queue depth:
+
+```go
+// $2.50 per position. Position 40 → front costs $97.50.
+wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
+```
+
+**Surge pricing** — cost rises with queue depth, rewarding early buyers:
+
+```go
+// Base $1.00 + 5¢ per person in the queue.
+// Queue of 100 → $6.00/position. Queue of 10 → $1.50/position.
+wr.SetRateFunc(func(depth int64) float64 {
+    return 1.00 + float64(depth)*0.05
+})
+```
+
+## Full setup walkthrough
+
+<Steps>
+
+### Configure RateFunc and SkipURL
+
+Set the pricing function and the URL of your payment page before any routes are registered:
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+// Surge pricing: $1.00 base + 5¢ per queued person.
+wr.SetRateFunc(func(depth int64) float64 {
+    return 1.00 + float64(depth)*0.05
+})
+
+// Where the "Pay to skip" button sends the client.
+wr.SetSkipURL("/queue/purchase")
+```
+
+### Register payment routes before RegisterRoutes
+
+Payment handlers must be registered **before** `RegisterRoutes` so they bypass the waiting room entirely. A payment handler stuck behind the queue it is trying to process is a deadlock.
+
+```go
+// These handlers are outside the waiting room — no queue cookie required.
+r.GET("/queue/purchase", handlePurchasePage)
+r.POST("/queue/purchase/confirm", handlePurchaseConfirm)
+
+// Everything registered after this line is gated.
+wr.RegisterRoutes(r)
+```
+
+### Quote the cost with QuoteCost
+
+Use `QuoteCost` to display the live price before the client commits. It is a read-only operation — no state changes, safe to call on every `/queue/status` poll.
+
+```go
+func handlePurchasePage(c *gin.Context) {
+    cookie, err := c.Request.Cookie("room_ticket")
+    if err != nil {
+        c.Status(http.StatusBadRequest)
+        return
+    }
+
+    // cost to jump all the way to position 1
+    cost, err := wr.QuoteCost(cookie.Value, 1)
+    if err != nil {
+        // See error handling section below.
+        c.Status(http.StatusBadRequest)
+        return
+    }
+
+    c.HTML(http.StatusOK, "purchase.html", gin.H{"cost": cost})
+}
+```
+
+### Call PromoteTokenToFront after payment
+
+After your payment provider confirms the charge, promote the client. The result includes the computed cost and, when VIP passes are configured, a `PassToken` to set as a cookie.
+
+```go
+func handlePurchaseConfirm(c *gin.Context) {
+    cookie, _ := c.Request.Cookie("room_ticket")
+
+    result, err := wr.PromoteTokenToFront(cookie.Value)
+    if err != nil {
+        c.Status(http.StatusBadRequest)
+        return
+    }
+
+    log.Printf("promoted for $%.2f", result.Cost)
+    c.Redirect(http.StatusSeeOther, "/")
+}
+```
+
+### Set the VIP pass cookie from result.PassToken
+
+If `SetPassDuration` is configured, `result.PassToken` is non-empty. Set it as the `room_pass` cookie so the client is auto-promoted on any future queue re-entry without paying again.
+
+```go
+if result.PassToken != "" {
+    http.SetCookie(c.Writer, &http.Cookie{
+        Name:     "room_pass",
+        Value:    result.PassToken,
+        Path:     wr.CookiePath(),
+        MaxAge:   int(wr.PassDuration().Seconds()),
+        HttpOnly: true,
+        Secure:   true,
+    })
+}
+```
+
+</Steps>
+
+## Partial skips with PromoteToken
+
+`PromoteTokenToFront` is a convenience wrapper for `PromoteToken(token, 1)`. Use `PromoteToken` directly to offer partial jumps at a lower price — useful for tiered pricing (e.g., "jump to top 10" vs. "jump to front").
+
+```go
+// Jump from position 50 to position 10 instead of position 1.
+result, err := wr.PromoteToken(token, 10)
+```
+
+The cost is still `distance × rate`, so partial skips charge proportionally less.
+
+## PromoteResult fields
+
+```go
+type PromoteResult struct {
+    // Cost is the price computed at promotion time based on the
+    // current RateFunc and queue position.
+    Cost float64
+
+    // PassToken is the VIP pass token to set as the room_pass cookie.
+    // Empty if SetPassDuration was not called or is 0.
+    PassToken string
+}
+```
+
+## Stripe integration pattern
+
+For webhook-based payment providers, the webhook handler cannot set cookies directly on the waiting client's browser. The pattern is to store the `PassToken` server-side keyed by the queue token, then apply the cookie in the success URL handler.
+
+```go
+// GET /queue/purchase — before RegisterRoutes, bypasses the waiting room.
+r.GET("/queue/purchase", func(c *gin.Context) {
+    cookie, _ := c.Request.Cookie("room_ticket")
+    cost, _ := wr.QuoteCost(cookie.Value, 1)
+
+    session, _ := stripe.CheckoutSessions.New(&stripe.CheckoutSessionParams{
+        LineItems: []*stripe.CheckoutSessionLineItemParams{{
+            PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+                Currency:   stripe.String("usd"),
+                UnitAmount: stripe.Int64(int64(cost * 100)),
+                ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+                    Name: stripe.String("Skip the line"),
+                },
+            },
+            Quantity: stripe.Int64(1),
+        }},
+        Mode:              stripe.String("payment"),
+        ClientReferenceID: stripe.String(cookie.Value),
+        SuccessURL:        stripe.String("https://example.com/"),
+        CancelURL:         stripe.String("https://example.com/"),
+    })
+    c.Redirect(http.StatusSeeOther, session.URL)
+})
+
+// POST /stripe/webhook — Stripe webhook, also before RegisterRoutes.
+r.POST("/stripe/webhook", func(c *gin.Context) {
+    event := verifyStripeSignature(c)
+    session := event.Data.Object
+    token := session["client_reference_id"].(string)
+
+    result, err := wr.PromoteTokenToFront(token)
+    if err != nil {
+        c.Status(http.StatusBadRequest)
+        return
+    }
+
+    // Webhooks can't set cookies — store the pass token server-side.
+    // Apply it in the success URL handler on the next page load.
+    storePassForClient(token, result.PassToken)
+
+    c.Status(http.StatusOK)
+})
+```
+
+## Error handling
+
+`QuoteCost`, `PromoteToken`, and `PromoteTokenToFront` return typed errors. Handle each case explicitly:
+
+| Error | Meaning | Action |
+|---|---|---|
+| `ErrPromotionDisabled` | `SetRateFunc` was never called | Check configuration |
+| `ErrTokenNotFound` | Token expired, already admitted, or never issued | Return 400; client should reload |
+| `ErrAlreadyAdmitted` | Client is already within the serving window | No action needed; redirect to app |
+| `ErrInvalidTargetPosition` | `targetPosition < 1` | Fix the call site |
+
+```go
+result, err := wr.PromoteTokenToFront(token)
+switch err.(type) {
+case nil:
+    // success
+case room.ErrAlreadyAdmitted:
+    // client is already in — redirect to the app
+    c.Redirect(http.StatusSeeOther, "/")
+    return
+case room.ErrTokenNotFound:
+    c.Status(http.StatusBadRequest)
+    return
+case room.ErrPromotionDisabled:
+    c.Status(http.StatusServiceUnavailable)
+    return
+default:
+    c.Status(http.StatusInternalServerError)
+    return
+}
+```
+
+<Note>
+Promotions are serialized under a dedicated mutex. Two concurrent calls to `PromoteToken` targeting the same position are safely handled — each receives a unique ticket number. There is no risk of two clients landing on the same slot.
+</Note>

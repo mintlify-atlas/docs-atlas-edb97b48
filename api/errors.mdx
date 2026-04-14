@@ -1,0 +1,385 @@
+---
+title: "Error reference — all typed errors returned by room"
+description: "room defines nine typed errors — struct fields, Error() strings, the methods that raise them, trigger conditions, and errors.As patterns."
+---
+
+`room` uses typed errors — every failure mode has its own concrete struct that implements `error`. This lets callers distinguish an invalid capacity from a token-not-found condition, a disabled promotion from an already-admitted client, without relying on string matching. Use `errors.As` or a direct type assertion to inspect the structured fields.
+
+---
+
+## Quick reference
+
+| Error type | Returned by | Trigger |
+|---|---|---|
+| `ErrInvalidCap` | `Init`, `SetCap` | Capacity `< 1` |
+| `ErrReaperInterval` | `SetReaperInterval` | Duration outside `[5s, 24h]` |
+| `ErrNotInitialised` | triggers HTTP 500 in `Middleware`, `StatusHandler`, `RegisterRoutes` | `Init` not called before use |
+| `ErrInvalidMaxQueueDepth` | `SetMaxQueueDepth` | Value `< 0` |
+| `ErrPromotionDisabled` | `QuoteCost`, `PromoteToken` | No `RateFunc` configured |
+| `ErrTokenNotFound` | `QuoteCost`, `PromoteToken` | Token expired, admitted, or never issued |
+| `ErrAlreadyAdmitted` | `QuoteCost`, `PromoteToken` | Position already `<= 0` |
+| `ErrInvalidTargetPosition` | `QuoteCost`, `PromoteToken` | `targetPosition < 1` |
+| `ErrPassDuration` | `SetPassDuration` | Duration outside `[1m, 24h]` (and non-zero) |
+
+---
+
+## Error types
+
+### ErrInvalidCap
+
+Returned when the capacity argument to `Init` or `SetCap` is less than 1. `Given` holds the value that was rejected.
+
+```go
+type ErrInvalidCap struct {
+    Given int32
+}
+
+func (e ErrInvalidCap) Error() string
+// "room: invalid capacity %d: must be >= 1"
+```
+
+<ResponseField name="Given" type="int32">
+  The invalid capacity value that was passed by the caller.
+</ResponseField>
+
+**Returned by:** `Init`, `SetCap`
+
+```go
+if err := wr.Init(0); err != nil {
+    var e room.ErrInvalidCap
+    if errors.As(err, &e) {
+        log.Fatalf("bad capacity: %d", e.Given)
+    }
+}
+```
+
+---
+
+### ErrReaperInterval
+
+Returned by `SetReaperInterval` when the provided duration falls outside the valid range `[5s, 24h]`. `Given`, `Min`, and `Max` carry the exact values for diagnostic messages.
+
+```go
+type ErrReaperInterval struct {
+    Given time.Duration
+    Min   time.Duration
+    Max   time.Duration
+}
+
+func (e ErrReaperInterval) Error() string
+// "room: reaper interval %s out of range [%s, %s]"
+```
+
+<ResponseField name="Given" type="time.Duration">
+  The rejected interval value.
+</ResponseField>
+
+<ResponseField name="Min" type="time.Duration">
+  The minimum accepted value (`5s`).
+</ResponseField>
+
+<ResponseField name="Max" type="time.Duration">
+  The maximum accepted value (`24h`).
+</ResponseField>
+
+**Returned by:** `SetReaperInterval`
+
+```go
+if err := wr.SetReaperInterval(500 * time.Millisecond); err != nil {
+    var e room.ErrReaperInterval
+    if errors.As(err, &e) {
+        log.Printf("reaper interval %s not in [%s, %s]", e.Given, e.Min, e.Max)
+    }
+}
+```
+
+---
+
+### ErrNotInitialised
+
+Returned when `Middleware` or `RegisterRoutes` is called on a `WaitingRoom` that has not been initialised via `Init`. This is a configuration error — the fix is always to call `Init` before any other method.
+
+```go
+type ErrNotInitialised struct{}
+
+func (e ErrNotInitialised) Error() string
+// "room: WaitingRoom not initialised — call Init before use"
+```
+
+**Triggers on:** `Middleware()`, `StatusHandler()`, `RegisterRoutes()` calls on an uninitialised room.
+
+<Note>
+`ErrNotInitialised` is not returned as a Go function return value — these methods abort the HTTP request with a `500 Internal Server Error` response when called on an uninitialised `WaitingRoom`. The error carry no fields because the root cause is always a missing `Init` call.
+</Note>
+
+```go
+// Middleware(), StatusHandler(), and RegisterRoutes() do not return errors.
+// Calling them before Init() causes every incoming request to receive HTTP 500.
+// Always call Init() before registering routes or using the middleware.
+wr := &room.WaitingRoom{}
+// wr.RegisterRoutes(r) // would cause HTTP 500 on every request
+
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+wr.RegisterRoutes(r) // safe — Init was called
+```
+
+---
+
+### ErrInvalidMaxQueueDepth
+
+Returned by `SetMaxQueueDepth` when the value is negative. A depth of zero is valid — it means unlimited (no cap on queue depth).
+
+```go
+type ErrInvalidMaxQueueDepth struct {
+    Given int64
+}
+
+func (e ErrInvalidMaxQueueDepth) Error() string
+// "room: invalid max queue depth %d: must be >= 0"
+```
+
+<ResponseField name="Given" type="int64">
+  The negative value that was rejected.
+</ResponseField>
+
+**Returned by:** `SetMaxQueueDepth`
+
+```go
+if err := wr.SetMaxQueueDepth(-1); err != nil {
+    var e room.ErrInvalidMaxQueueDepth
+    if errors.As(err, &e) {
+        log.Printf("queue depth %d is invalid — use 0 for unlimited", e.Given)
+    }
+}
+```
+
+---
+
+### ErrPromotionDisabled
+
+Returned when `QuoteCost` or `PromoteToken` is called without a `RateFunc` configured via `SetRateFunc`. Promotions are disabled by default — you must provide a pricing function to enable skip-the-line functionality.
+
+```go
+type ErrPromotionDisabled struct{}
+
+func (e ErrPromotionDisabled) Error() string
+// "room: promotions disabled — call SetRateFunc first"
+```
+
+**Returned by:** `QuoteCost`, `PromoteToken`, `PromoteTokenToFront`
+
+```go
+cost, err := wr.QuoteCost(token, 1)
+if errors.Is(err, room.ErrPromotionDisabled{}) {
+    // Show a non-payment waiting room page.
+    renderStandardQueue(c)
+    return
+}
+```
+
+---
+
+### ErrTokenNotFound
+
+Returned when the token does not exist in the token store. This covers three distinct cases: the token has expired and been reaped, the token was already admitted and removed from the queue, or the token was never issued (e.g. the cookie was forged or lost).
+
+```go
+type ErrTokenNotFound struct{}
+
+func (e ErrTokenNotFound) Error() string
+// "room: token not found"
+```
+
+**Returned by:** `QuoteCost`, `PromoteToken`, `PromoteTokenToFront`
+
+<Note>
+`ErrTokenNotFound` does not expose a `Given` field — revealing which tokens exist or don't would be an information leak. Log the token server-side for debugging; return a generic error to the client.
+</Note>
+
+```go
+result, err := wr.PromoteTokenToFront(token)
+if errors.Is(err, room.ErrTokenNotFound{}) {
+    c.JSON(http.StatusNotFound, gin.H{"error": "session expired — please refresh"})
+    return
+}
+```
+
+---
+
+### ErrAlreadyAdmitted
+
+Returned when a promotion is attempted on a token that is already within the serving window (queue position ≤ 0). The client is already being served — there is nothing to promote.
+
+```go
+type ErrAlreadyAdmitted struct{}
+
+func (e ErrAlreadyAdmitted) Error() string
+// "room: token already within serving window"
+```
+
+**Returned by:** `QuoteCost`, `PromoteToken`, `PromoteTokenToFront`
+
+```go
+cost, err := wr.QuoteCost(token, 1)
+if errors.Is(err, room.ErrAlreadyAdmitted{}) {
+    // Client is already in — refund the payment attempt.
+    c.JSON(http.StatusOK, gin.H{"message": "already admitted"})
+    return
+}
+```
+
+---
+
+### ErrInvalidTargetPosition
+
+Returned when `targetPosition < 1`. Position 1 is the minimum valid target — it means "next to be admitted". A position of zero or negative has no defined meaning in the ticket space.
+
+```go
+type ErrInvalidTargetPosition struct {
+    Given int64
+}
+
+func (e ErrInvalidTargetPosition) Error() string
+// "room: invalid target position %d: must be >= 1"
+```
+
+<ResponseField name="Given" type="int64">
+  The invalid target position value provided by the caller.
+</ResponseField>
+
+**Returned by:** `QuoteCost`, `PromoteToken`
+
+```go
+result, err := wr.PromoteToken(token, targetPos)
+if errors.As(err, &room.ErrInvalidTargetPosition{}) {
+    var e room.ErrInvalidTargetPosition
+    errors.As(err, &e)
+    c.JSON(http.StatusBadRequest, gin.H{
+        "error": fmt.Sprintf("target position %d is invalid: must be >= 1", e.Given),
+    })
+    return
+}
+```
+
+---
+
+### ErrPassDuration
+
+Returned by `SetPassDuration` when the provided duration is non-zero but falls outside the valid range `[1m, 24h]`. A duration of exactly zero is valid — it disables passes.
+
+```go
+type ErrPassDuration struct {
+    Given time.Duration
+    Min   time.Duration
+    Max   time.Duration
+}
+
+func (e ErrPassDuration) Error() string
+// "room: pass duration %s out of range [%s, %s]"
+```
+
+<ResponseField name="Given" type="time.Duration">
+  The rejected duration.
+</ResponseField>
+
+<ResponseField name="Min" type="time.Duration">
+  The minimum accepted non-zero value (`1m`).
+</ResponseField>
+
+<ResponseField name="Max" type="time.Duration">
+  The maximum accepted value (`24h`).
+</ResponseField>
+
+**Returned by:** `SetPassDuration`
+
+```go
+if err := wr.SetPassDuration(30 * time.Second); err != nil {
+    var e room.ErrPassDuration
+    if errors.As(err, &e) {
+        log.Printf("pass duration %s not in [%s, %s]", e.Given, e.Min, e.Max)
+    }
+}
+```
+
+---
+
+## Error handling patterns
+
+<Tabs>
+  <Tab title="errors.As (structured fields)">
+    Use `errors.As` when you need to read the structured fields on the error value:
+
+    ```go
+    result, err := wr.PromoteToken(token, targetPos)
+    if err != nil {
+        var capErr room.ErrInvalidCap
+        var posErr room.ErrInvalidTargetPosition
+        var reaperErr room.ErrReaperInterval
+        var passErr room.ErrPassDuration
+        var depthErr room.ErrInvalidMaxQueueDepth
+
+        switch {
+        case errors.As(err, &capErr):
+            log.Printf("bad cap: %d", capErr.Given)
+        case errors.As(err, &posErr):
+            log.Printf("bad position: %d", posErr.Given)
+        case errors.As(err, &reaperErr):
+            log.Printf("reaper interval %s out of [%s, %s]", reaperErr.Given, reaperErr.Min, reaperErr.Max)
+        case errors.As(err, &passErr):
+            log.Printf("pass duration %s out of [%s, %s]", passErr.Given, passErr.Min, passErr.Max)
+        case errors.As(err, &depthErr):
+            log.Printf("queue depth %d is invalid", depthErr.Given)
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="errors.Is (sentinel errors)">
+    For errors with no fields, `errors.Is` works because zero-value structs compare equal:
+
+    ```go
+    cost, err := wr.QuoteCost(token, 1)
+    switch {
+    case err == nil:
+        renderPaymentPage(c, cost)
+    case errors.Is(err, room.ErrPromotionDisabled{}):
+        renderStandardQueue(c)
+    case errors.Is(err, room.ErrTokenNotFound{}):
+        c.JSON(http.StatusNotFound, gin.H{"error": "session expired"})
+    case errors.Is(err, room.ErrAlreadyAdmitted{}):
+        c.JSON(http.StatusOK, gin.H{"message": "already admitted"})
+    default:
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+    }
+    ```
+  </Tab>
+  <Tab title="Type switch">
+    A type switch handles all cases in one block and gives access to fields without a separate `errors.As` call:
+
+    ```go
+    result, err := wr.PromoteTokenToFront(token)
+    if err != nil {
+        switch e := err.(type) {
+        case room.ErrPromotionDisabled:
+            c.JSON(http.StatusUnprocessableEntity, gin.H{"error": e.Error()})
+        case room.ErrTokenNotFound:
+            c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+        case room.ErrAlreadyAdmitted:
+            c.JSON(http.StatusConflict, gin.H{"error": "already in service"})
+        case room.ErrInvalidTargetPosition:
+            c.JSON(http.StatusBadRequest, gin.H{
+                "error": fmt.Sprintf("position %d invalid", e.Given),
+            })
+        default:
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected error"})
+        }
+        return
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+All `room` errors are value types (not pointer receivers), so `errors.As` requires a non-pointer target: `var e room.ErrInvalidCap` not `var e *room.ErrInvalidCap`. The zero-value of any error struct compares equal to another zero-value of the same type, making `errors.Is` safe for the fieldless sentinel errors (`ErrNotInitialised`, `ErrPromotionDisabled`, `ErrTokenNotFound`, `ErrAlreadyAdmitted`).
+</Tip>

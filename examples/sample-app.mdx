@@ -1,0 +1,286 @@
+---
+title: "Running the bundled basic-web-app sample application"
+description: "Explore every room feature end-to-end with the bundled sample app: waiting room, skip-the-line payments, VIP passes, and runtime capacity adjustment."
+---
+
+The sample app in `sample/basic-web-app/` demonstrates every `room` feature end-to-end in a four-page Gin application. It ships with a load-test script that builds the server, launches 30 concurrent simulated clients, and prints a live dashboard while the waiting room queues and admits them. You can open the app in a browser at the same time to watch your queue position tick down in real time — and click "Skip the line" to test the simulated payment flow.
+
+## Quick start — automated load test
+
+The fastest way to see the waiting room in action:
+
+```bash
+cd sample/basic-web-app
+bash test.sh
+```
+
+The script handles everything: building the server binary, starting it on `:8080`, ramping up 30 concurrent clients with a 50 ms stagger between each, printing a live dashboard, and printing a summary when the test finishes.
+
+<Note>
+  Requirements: `bash >= 5.2`, `go`, `curl`, and `jq`. On macOS install `jq` with `brew install jq`; on Linux use `apt install jq`.
+</Note>
+
+### Live dashboard
+
+While the test runs you will see a single updating line in your terminal:
+
+```text
+  [ 15s] sent:120  served:42   queued:78   err:0   active:83  ~2 req/s [wave 4]
+```
+
+| Column | Meaning |
+|---|---|
+| `sent` | Total HTTP requests dispatched by the test clients |
+| `served` | Requests that received a 200 response after being admitted |
+| `queued` | Requests that entered the waiting room and polled for admission |
+| `err` | Requests that timed out or received a non-200 response |
+| `active` | Background client goroutines still running |
+| `~N req/s` | Effective throughput since the test started |
+
+### Results summary
+
+After the load test and drain phase complete, the script prints a results table:
+
+```text
+╔══════════════════════════════════════════════════╗
+║   Results                                       ║
+╠══════════════════════════════════════════════════╣
+║  Total sent:               191                  ║
+║  Served (200):             191                  ║
+║  Queued (waited):          187                  ║
+║  Errors:                     0                  ║
+║  Throughput:               3 req/s              ║
+╠══════════════════════════════════════════════════╣
+║  FULL transitions:           7                  ║
+║  DRAIN transitions:          7                  ║
+║  QUEUE events:             187                  ║
+╚══════════════════════════════════════════════════╝
+
+✓ Waiting room activated — 187 requests queued.
+```
+
+Every request was served — none were dropped. The waiting room queued 187 of 191 requests, and the room reached full capacity 7 times during the 30-second test.
+
+## Manual run
+
+To explore the server interactively alongside a load generator:
+
+<Steps>
+  <Step title="Terminal 1 — start the server">
+    ```bash
+    cd sample/basic-web-app
+    go run .
+    ```
+
+    You should see:
+
+    ```text
+    [ INFO  ] listening on http://localhost:8080  cap=5  rate=$2.50/pos  pass=1h30m0s
+    ```
+  </Step>
+
+  <Step title="Browser — open the app">
+    ```bash
+    open http://localhost:8080
+    ```
+
+    With no load, you are admitted immediately. The home page shows the capacity (`5 concurrent requests`) and the skip-the-line pricing (`$2.50/position`, 90-minute VIP pass).
+  </Step>
+
+  <Step title="Terminal 2 — generate load">
+    ```bash
+    ab -c 100 -n 1000 localhost:8080/about
+    ```
+
+    Apache Bench opens 100 concurrent connections. With a cap of 5 and each handler sleeping 500 ms, the room fills immediately and `ab` drives a deep queue. Switch back to Terminal 1 to watch the lifecycle events stream past.
+  </Step>
+
+  <Step title="Browser — see the waiting room">
+    Reload `http://localhost:8080/about` while `ab` is running. You will land in the waiting room, see your queue position, and watch it tick down every 3 seconds as slots open. When your position reaches 0 the page reloads automatically — no manual refresh required.
+  </Step>
+</Steps>
+
+## What the sample configures
+
+The sample intentionally uses a small cap and simulated latency so the waiting room is visible immediately during a load test. In production, remove `time.Sleep` — real database queries and downstream API calls provide the natural latency that holds slots open.
+
+| Setting | Value | Why |
+|---|---|---|
+| `Init(5)` | Cap of 5 | Fills immediately at `ab -c 100` |
+| `simulatedLatency` | 500 ms per handler | Holds each slot long enough to observe queuing |
+| `SetRateFunc` | `$2.50/position` flat | Demonstrates the skip-the-line offer |
+| `SetSkipURL` | `/queue/purchase` | Enables the "Pay to skip" button |
+| `SetPassDuration` | 90 minutes | Demonstrates VIP pass auto-promotion |
+| `SetReaperInterval` | 10 seconds | Cleans up `ab`'s abandoned connections quickly |
+
+## Server log output
+
+The sample uses `gin.New()` (not `gin.Default()`) with a custom `requestLogger` that prints on request arrival (`-->`) and completion (`<--`). This makes room events and request logs appear in the correct order — `gin.Default()`'s built-in logger only prints after the handler returns, which buries queue activity.
+
+```text
+[ INFO  ] listening on http://localhost:8080  cap=5
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ ENTER   ] slot acquired  occupancy=1/5  queue=0  util=20%
+[ ENTER   ] slot acquired  occupancy=5/5  queue=0  util=100%
+[ FULL    ] capacity reached  occupancy=5/5  queue=0  util=100%
+[ QUEUE   ] request queued  depth=1  occupancy=5/5  util=100%
+[ QUEUE   ] request queued  depth=2  occupancy=5/5  util=100%
+[ EXIT    ] slot released  occupancy=4/5  queue=95  util=80%
+[ DRAIN   ] room no longer full  occupancy=4/5  queue=95
+[ ENTER   ] slot acquired  occupancy=5/5  queue=94  util=100%
+[ FULL    ] capacity reached  occupancy=5/5  queue=94  util=100%
+[ REQ   ] <-- GET /about  status=200  latency=500ms
+```
+
+Filter the output with `grep` to focus on specific event types:
+
+```bash
+# Room events only — filter out per-request noise
+go run main.go 2>&1 | grep -v '\[ REQ'
+
+# Only queueing events — watch the queue depth grow
+go run main.go 2>&1 | grep '\[ QUEUE'
+
+# Only full-capacity moments
+go run main.go 2>&1 | grep '\[ FULL'
+
+# Count how many requests were queued
+go run main.go 2>&1 | grep -c '\[ QUEUE'
+```
+
+## Testing the skip-the-line flow
+
+<Steps>
+  <Step title="Land in the waiting room">
+    With `ab` generating load, browse to `http://localhost:8080/about`. You will see the waiting room page with your queue position and a "Skip the line" card showing the current price.
+  </Step>
+
+  <Step title="Click Skip the line">
+    The button links to `/queue/purchase`, which reads your `room_ticket` cookie, calls `QuoteCost`, and displays the total cost to jump to position 1.
+
+    In the sample this is a simulated payment page — no real charge is made. In production, this handler would create a Stripe Checkout session and redirect to `session.URL`.
+  </Step>
+
+  <Step title="Confirm the payment">
+    Click "Confirm payment". The `POST /queue/purchase/confirm` handler calls `wr.PromoteTokenToFront(token)`, sets the `room_pass` cookie from `result.PassToken`, and redirects to `/`.
+  </Step>
+
+  <Step title="Verify the VIP pass badge">
+    After confirmation, the next status poll returns `has_pass: true` and the waiting room page shows a "VIP pass active" badge instead of the purchase offer. You are admitted on the next poll cycle.
+
+    Refresh the page after admission. You will land in the queue again — but `room` sees the `room_pass` cookie and calls `autoPromote` immediately. Your new ticket jumps to the front without another payment.
+  </Step>
+</Steps>
+
+## Runtime capacity adjustment
+
+Because `wr` is a package-level variable, you can change capacity while the server is running. The sample wires up an admin endpoint registered before `RegisterRoutes` so it bypasses the queue:
+
+```go
+r.POST("/admin/cap", func(c *gin.Context) {
+    var body struct {
+        Cap int32 `json:"cap"`
+    }
+    if err := c.ShouldBindJSON(&body); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    if err := wr.SetCap(body.Cap); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{
+        "cap":         wr.Cap(),
+        "occupancy":   wr.Len(),
+        "queue_depth": wr.QueueDepth(),
+        "utilization": fmt.Sprintf("%.0f%%", wr.Utilization()*100),
+    })
+})
+```
+
+While `ab` is running in Terminal 2, send a capacity change from Terminal 3:
+
+```bash
+# Double capacity — watch a burst of ENTER events as the queue drains
+curl -s -X POST http://localhost:8080/admin/cap \
+     -H 'Content-Type: application/json' \
+     -d '{"cap": 10}' | jq
+
+# Halve it again — the room fills and FULL fires
+curl -s -X POST http://localhost:8080/admin/cap \
+     -H 'Content-Type: application/json' \
+     -d '{"cap": 5}' | jq
+```
+
+<Tip>
+  Watch Terminal 1 after the capacity increase. You will see a burst of `ENTER` events as queued requests rush into the newly opened slots, followed immediately by a `FULL` event as the higher cap fills again.
+</Tip>
+
+## Common mistakes
+
+### Handlers return too fast — the room never fills up
+
+```go
+// Wrong — returns in microseconds; the room stays at occupancy=1
+func aboutPage(c *gin.Context) {
+    c.String(http.StatusOK, "About")
+}
+
+// Correct for load testing — holds the slot long enough to observe queuing
+func aboutPage(c *gin.Context) {
+    time.Sleep(500 * time.Millisecond)
+    c.String(http.StatusOK, "About")
+}
+```
+
+In production you do not need `time.Sleep` — real database queries, template rendering, and downstream API calls hold slots naturally.
+
+### Using gin.Default() — room events are buried
+
+```go
+// Wrong — gin's Logger buffers output until after the handler returns.
+// Room events appear out of order; queue activity is invisible.
+r := gin.Default()
+
+// Correct — install your own logger that prints on arrival, not completion.
+r := gin.New()
+r.Use(gin.Recovery())
+r.Use(requestLogger())
+```
+
+### Registering application routes before RegisterRoutes
+
+```go
+// Wrong — /about is not gated; it bypasses the waiting room
+r.GET("/about", aboutPage)
+wr.RegisterRoutes(r)
+
+// Correct — all routes after RegisterRoutes are protected
+wr.RegisterRoutes(r)
+r.GET("/about", aboutPage)
+```
+
+### Forgetting defer wr.Stop()
+
+Without it the background reaper goroutine outlives the HTTP server. In tests that construct and discard `WaitingRoom` instances it leaks goroutines and triggers the race detector.
+
+```go
+wr = &room.WaitingRoom{}
+if err := wr.Init(5); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop() // always pair Init with Stop
+```
+
+## Topics covered
+
+The sample and its README walk through all of `room`'s major features in tutorial order:
+
+- Capacity tuning and the effect of `cap` on queue behavior
+- Lifecycle callbacks: `EventFull`, `EventDrain`, `EventQueue`, `EventEnter`, `EventExit`, `EventEvict`, `EventTimeout`, `EventPromote`
+- Log filtering with `grep` tags
+- Runtime capacity adjustment via an admin endpoint
+- Skip-the-line pricing with `SetRateFunc` and `SetSkipURL`
+- VIP pass configuration with `SetPassDuration` and the `room_pass` cookie
+- Custom HTML via `SetHTML`
+- Common mistakes and how to avoid them

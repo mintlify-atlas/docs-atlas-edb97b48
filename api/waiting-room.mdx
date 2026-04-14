@@ -1,0 +1,212 @@
+---
+title: "WaitingRoom: core type, methods, and introspection API"
+description: "Central type in the room library, combining a semaphore and ticket queue for FIFO admission control with routing, configuration, and introspection methods."
+---
+
+`WaitingRoom` is the central type in the `room` package. It pairs a semaphore (backed by [`sema`](https://github.com/andreimerlescu/sema)) with an atomic ticket counter to enforce a capacity-bounded, ticket-ordered waiting room in front of your Gin handlers. When the server is below capacity, requests pass through immediately. When it is at capacity, new arrivals receive a waiting room HTML page and poll `/queue/status` until a slot opens.
+
+<Note>
+The zero value of `WaitingRoom` is not usable. Always construct it through `NewWaitingRoom`, or initialize it manually with `Init` before calling any other method.
+</Note>
+
+## Construction paths
+
+There are two ways to create a working `WaitingRoom`. Choose based on whether you need an explicit handle to the struct after construction.
+
+### Simple path — `NewWaitingRoom`
+
+`NewWaitingRoom` is a single call that creates and initializes a `WaitingRoom`, registers `GET /queue/status`, and returns the middleware `gin.HandlerFunc`. Use it when you have a long-lived server process and do not need to call `Stop`.
+
+```go
+r := gin.Default()
+r.Use(room.NewWaitingRoom(r, 500))
+r.GET("/", myHandler)
+r.Run(":8080")
+```
+
+The background reaper goroutine started by `NewWaitingRoom` is tied to the process lifetime. There is no way to stop it later because `NewWaitingRoom` does not expose the underlying `WaitingRoom`.
+
+### Full-control path — `Init` / `Stop`
+
+When you need to configure the room before serving traffic, run tests, embed the server, or ensure a clean goroutine shutdown, construct the `WaitingRoom` manually.
+
+```go
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+wr.SetSecureCookie(true)
+wr.SetReaperInterval(30 * time.Second)
+
+wr.RegisterRoutes(r)
+r.GET("/", myHandler)
+r.Run(":8080")
+```
+
+`Stop` is idempotent and safe to call with `defer`. It cancels the background reaper without affecting in-flight requests.
+
+## Routing setup
+
+### `RegisterRoutes` (recommended)
+
+`RegisterRoutes` is the standard way to wire a `WaitingRoom` into a Gin engine. It registers three things in the correct order:
+
+1. `OPTIONS /queue/status` — no-content handler for CORS preflight
+2. `GET /queue/status` — the status polling endpoint
+3. `r.Use(wr.Middleware())` — the waiting room gate for all subsequent routes
+
+```go
+wr.RegisterRoutes(r)
+// Register application routes AFTER this call.
+r.GET("/products", listProducts)
+```
+
+<Warning>
+Register any bypass routes (payment pages, webhooks) **before** calling `RegisterRoutes`. The middleware is applied to every route registered after `r.Use(...)` is called.
+</Warning>
+
+### Manual setup
+
+If you need explicit control — for example, to mount the status handler on a sub-router or under a different path — register each piece individually.
+
+```go
+// CORS preflight for cross-origin polling
+r.OPTIONS("/queue/status", func(c *gin.Context) {
+    c.Status(http.StatusNoContent)
+})
+r.GET("/queue/status", wr.StatusHandler())
+r.Use(wr.Middleware())
+```
+
+<Note>
+If your deployment has CORS middleware active, or if the waiting room page is served from a different origin than the status endpoint, the `OPTIONS` handler is required. `RegisterRoutes` adds it automatically; the manual path requires you to add it yourself.
+</Note>
+
+## Public methods overview
+
+### Construction and lifecycle
+
+| Method | Signature | Description |
+|---|---|---|
+| `Init` | `(cap int32) error` | Initialize the room and start the background reaper. |
+| `Stop` | `()` | Cancel the background reaper. Safe to defer. |
+
+### Routing
+
+| Method | Signature | Description |
+|---|---|---|
+| `RegisterRoutes` | `(r *gin.Engine)` | Register OPTIONS + GET `/queue/status` and attach middleware. |
+| `Middleware` | `() gin.HandlerFunc` | The waiting room gate handler. |
+| `StatusHandler` | `() gin.HandlerFunc` | The `/queue/status` polling handler. |
+
+### Configuration — capacity
+
+| Method | Signature | Description |
+|---|---|---|
+| `SetCap` | `(cap int32) error` | Adjust capacity at runtime. Returns `ErrInvalidCap` if `cap < 1`. |
+| `Cap` | `() int32` | Current capacity. |
+| `SetMaxQueueDepth` | `(max int64) error` | Cap queue length; 0 = unlimited. |
+| `MaxQueueDepth` | `() int64` | Current queue depth limit. |
+
+### Configuration — cookies
+
+| Method | Signature | Description |
+|---|---|---|
+| `SetSecureCookie` | `(secure bool)` | Set the `Secure` flag on `room_ticket`. Default: `false`. |
+| `SetCookiePath` | `(path string)` | Cookie `Path` attribute. Default: `"/"`. |
+| `CookiePath` | `() string` | Current cookie path. |
+| `SetCookieDomain` | `(domain string)` | Cookie `Domain` attribute. Default: `""`. |
+| `CookieDomain` | `() string` | Current cookie domain. |
+
+### Configuration — reaper
+
+| Method | Signature | Description |
+|---|---|---|
+| `SetReaperInterval` | `(d time.Duration) error` | Change eviction frequency. Range: 5s–24h. |
+| `ReaperInterval` | `() time.Duration` | Current eviction interval. |
+
+### Configuration — skip-the-line
+
+| Method | Signature | Description |
+|---|---|---|
+| `SetRateFunc` | `(fn RateFunc)` | Pricing function for queue promotions. |
+| `SetSkipURL` | `(url string)` | Payment page URL shown on the waiting room page. |
+| `SkipURL` | `() string` | Current skip URL. |
+| `SetPassDuration` | `(d time.Duration) error` | VIP pass lifetime. 0 = disabled. Range: 1m–24h. |
+| `PassDuration` | `() time.Duration` | Current pass duration. |
+
+### Configuration — appearance
+
+| Method | Signature | Description |
+|---|---|---|
+| `SetHTML` | `(html []byte)` | Replace the default waiting room page. `nil` reverts to built-in. |
+
+### Introspection
+
+| Method | Signature | Description |
+|---|---|---|
+| `Cap` | `() int32` | Maximum concurrently active requests. |
+| `Len` | `() int` | Requests currently being actively served. |
+| `QueueDepth` | `() int64` | Requests currently waiting for a slot. |
+| `Utilization` | `() float64` | Instantaneous ratio of active to capacity. |
+| `UtilizationSmoothed` | `() float64` | EWMA-smoothed utilization. |
+
+## Introspection methods
+
+### `Cap`
+
+```go
+func (wr *WaitingRoom) Cap() int32
+```
+
+Returns the current maximum number of requests that can be served concurrently. This value reflects the last successful `Init` or `SetCap` call.
+
+### `Len`
+
+```go
+func (wr *WaitingRoom) Len() int
+```
+
+Returns the number of requests currently holding a semaphore slot — i.e., actively being processed by application handlers downstream of the middleware. This is distinct from the number of requests waiting in the queue.
+
+### `QueueDepth`
+
+```go
+func (wr *WaitingRoom) QueueDepth() int64
+```
+
+Returns the number of requests that have been issued a ticket but are not yet within the serving window. A value of 0 means the room is at or below capacity and no one is waiting.
+
+```go
+depth := wr.QueueDepth()
+if depth > 1000 {
+    log.Printf("queue pressure: %d waiting", depth)
+}
+```
+
+### `Utilization`
+
+```go
+func (wr *WaitingRoom) Utilization() float64
+```
+
+Returns the instantaneous ratio of active requests to capacity, in the range `[0.0, 1.0]`. A value of `1.0` means the room is fully occupied. This metric can spike sharply on sudden traffic bursts.
+
+### `UtilizationSmoothed`
+
+```go
+func (wr *WaitingRoom) UtilizationSmoothed() float64
+```
+
+Returns the EWMA-smoothed utilization. The smoothing is applied by the underlying `sema` semaphore. Prefer this over `Utilization` for dashboards, alerting thresholds, and autoscaler feedback loops where sudden spikes would cause false positives.
+
+```go
+// Expose metrics to Prometheus
+http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintf(w, "room_utilization %f\n", wr.UtilizationSmoothed())
+    fmt.Fprintf(w, "room_queue_depth %d\n", wr.QueueDepth())
+    fmt.Fprintf(w, "room_active %d\n", wr.Len())
+})
+```
